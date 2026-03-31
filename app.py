@@ -2,6 +2,7 @@ import json
 import math
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
+import random
 
 import numpy as np
 import pandas as pd
@@ -12,7 +13,14 @@ import urllib3
 import folium
 from folium.plugins import HeatMap
 
-st.markdown("""
+st.set_page_config(
+    page_title="North East & Yorkshire Grid Digital Twin",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
 <style>
 body {
     background-color: #0e1117;
@@ -39,11 +47,10 @@ body {
     border-radius: 10px;
 }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# =========================================================
-# SSL / SESSION
-# =========================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 session = requests.Session()
@@ -52,18 +59,6 @@ session.headers.update({
     "User-Agent": "north-east-yorkshire-digital-twin/3.0"
 })
 
-# =========================================================
-# PAGE CONFIG
-# =========================================================
-st.set_page_config(
-    page_title="North East & Yorkshire Grid Digital Twin",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# =========================================================
-# OPTIONAL AUTO-REFRESH (30 SECONDS, NO EXTRA PACKAGE)
-# =========================================================
 components.html(
     """
     <script>
@@ -75,9 +70,6 @@ components.html(
     height=0,
 )
 
-# =========================================================
-# CONSTANTS
-# =========================================================
 NPG_DATASET_URL = (
     "https://northernpowergrid.opendatasoft.com/api/explore/v2.1/"
     "catalog/datasets/live-power-cuts-data/records"
@@ -202,20 +194,49 @@ REGIONS = {
     },
 }
 
-# =========================================================
-# HELPERS
-# =========================================================
+
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
 def safe_float(value) -> Optional[float]:
     try:
+        if isinstance(value, pd.Series):
+            if len(value) == 0:
+                return None
+            value = value.iloc[0]
+        elif isinstance(value, (list, tuple, np.ndarray)):
+            if len(value) == 0:
+                return None
+            value = value[0]
+
         if value is None or value == "":
             return None
+
+        if pd.isna(value):
+            return None
+
         return float(value)
     except Exception:
         return None
+
+
+def force_scalar(x):
+    if isinstance(x, pd.Series):
+        if len(x) == 0:
+            return None
+        return safe_float(x.iloc[0])
+    if isinstance(x, (list, tuple, np.ndarray)):
+        if len(x) == 0:
+            return None
+        return safe_float(x[0])
+    return safe_float(x) if isinstance(x, (int, float, np.integer, np.floating, str, type(None))) else x
+
+
+def ensure_scalar_dict(row):
+    if isinstance(row, pd.Series):
+        row = row.to_dict()
+    return {k: force_scalar(v) if isinstance(v, (pd.Series, list, tuple, np.ndarray, int, float, np.integer, np.floating, str, type(None))) else v for k, v in row.items()}
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -257,9 +278,7 @@ def solar_interpretation(current: Dict) -> Tuple[str, str]:
 
     return f"{solar} W/m²", f"Daytime solar conditions. Cloud cover is {cloud}%."
 
-# =========================================================
-# DATA ACCESS
-# =========================================================
+
 @st.cache_data(ttl=25, show_spinner=False)
 def fetch_weather(lat: float, lon: float) -> Dict:
     params = {
@@ -441,22 +460,22 @@ def standardise_outage_df(df: pd.DataFrame, region_name: str) -> pd.DataFrame:
 
     return df
 
-# =========================================================
-# FEATURE ENGINEERING
-# =========================================================
-
-# =========================================================
-# ADVANCED RISK ENGINE 
-# =========================================================
-import random
 
 def renewable_generation_model(row):
-    solar = safe_float(row.get("shortwave_radiation")) or 0
-    wind = safe_float(row.get("wind_speed_10m")) or 0
-    
+    if isinstance(row, pd.Series):
+        row = row.to_dict()
+
+    solar = safe_float(row.get("shortwave_radiation"))
+    wind = safe_float(row.get("wind_speed_10m"))
+
+    if solar is None:
+        solar = 0
+    if wind is None:
+        wind = 0
+
     solar_power = solar * 0.2
     wind_power = min((wind / 12) ** 3, 1) * 100
-    
+
     return solar_power + wind_power
 
 
@@ -469,48 +488,200 @@ def ev_load_model(hour: int, base_load=1.0):
 
 
 def compute_multilayer_risk(row, outage_intensity=0.0, hour=12):
+    if isinstance(row, pd.Series):
+        row = row.to_dict()
+
+    row = ensure_scalar_dict(row)
+
     wind = safe_float(row.get("wind_speed_10m")) or 0
     rain = safe_float(row.get("precipitation")) or 0
     cloud = safe_float(row.get("cloud_cover")) or 0
     pm25 = safe_float(row.get("pm2_5")) or 0
     aqi = safe_float(row.get("european_aqi")) or 0
 
-    env = (wind/60)*0.4 + (rain/5)*0.2 + (cloud/100)*0.1 + (aqi/100)*0.3
-    infra = outage_intensity
+    env = (wind / 60) * 0.4 + (rain / 5) * 0.2 + (cloud / 100) * 0.1 + (aqi / 100) * 0.3
+    infra = float(outage_intensity or 0)
 
     ev_load = ev_load_model(hour)
     renewable = renewable_generation_model(row)
-    net_load = ev_load*100 - renewable
+    net_load = ev_load * 100 - renewable
 
-    operational = clamp(net_load/200, 0, 1)
+    operational = clamp(net_load / 200, 0, 1)
+    
+    total = (0.5 * env + 0.3 * infra + 0.2 * operational) * 100
+    total = clamp(float(total), 0, 100)
+    compound = compound_hazard_index(row)
+    total += clamp(compound * 10, 0, 15)
 
-    total = (0.5*env + 0.3*infra + 0.2*operational)*100
-    total = clamp(total, 0, 100)
-
-    failure_prob = 1/(1+np.exp(-0.08*(total-50)))
+    failure_prob = 1 / (1 + np.exp(-0.08 * (total - 50)))
 
     return {
-        "risk_score": round(total,2),
-        "failure_probability": round(failure_prob,3),
-        "net_load": round(net_load,2),
-        "renewable_generation": round(renewable,2)
+        "risk_score": round(float(total), 2),
+        "failure_probability": round(float(failure_prob), 3),
+        "net_load": round(float(net_load), 2),
+        "renewable_generation": round(float(renewable), 2),
     }
+
+
+class ScenarioEngine:
+    def __init__(self, scenario_name="baseline"):
+        self.scenario_name = scenario_name
+        self.params = self._load_scenario(scenario_name)
+
+    def _load_scenario(self, name):
+        scenarios = {
+        "baseline": {"wind": 1.0, "rain": 1.0, "temp": 0, "infra": 1.0},
+
+        "storm_cascade": {
+            "wind": 2.2,
+            "rain": 1.6,
+            "temp": -1,
+            "infra": 1.4,
+        },
+
+        "flood_infrastructure": {
+            "wind": 1.3,
+            "rain": 3.5,
+            "temp": 0,
+            "infra": 1.8,
+        },
+
+        "heatwave_peak": {
+            "wind": 0.6,
+            "rain": 0.2,
+            "temp": +10,
+            "infra": 1.5,
+        },
+
+        "pollution_event": {
+            "wind": 0.4,
+            "rain": 0.1,
+            "temp": +5,
+            "infra": 1.2,
+        },
+
+        "compound_extreme": {
+            "wind": 1.8,
+            "rain": 2.8,
+            "temp": +6,
+            "infra": 2.0,
+        },
+    }
+        return scenarios.get(name, scenarios["baseline"])
+
+    def apply(self, row):
+        if isinstance(row, pd.Series):
+            row = row.to_dict()
+        row = dict(row)
+        row["wind_speed_10m"] = (safe_float(row.get("wind_speed_10m")) or 0) * self.params["wind"]
+        row["precipitation"] = (safe_float(row.get("precipitation")) or 0) * self.params["rain"]
+        row["temperature_2m"] = (safe_float(row.get("temperature_2m")) or 0) + self.params["temp"]
+        return row
+
+
+class InfrastructureGraph:
+    def __init__(self):
+        self.graph = {
+            "power": {"depends_on": [], "impact_factor": 1.0},
+            "water": {"depends_on": ["power"], "impact_factor": 0.7},
+            "telecom": {"depends_on": ["power"], "impact_factor": 0.8},
+            "transport": {"depends_on": ["power", "telecom"], "impact_factor": 0.6},
+        }
+
+    def propagate_failure(self, base_failure):
+        base_failure = clamp(float(base_failure or 0), 0, 1)
+        system_state = {"power": base_failure}
+
+        for infra, config in self.graph.items():
+            if infra == "power":
+                continue
+
+            dependency_failures = [
+                system_state.get(dep, 0) for dep in config["depends_on"]
+            ]
+
+            if dependency_failures:
+                combined = np.mean(dependency_failures)
+                system_state[infra] = clamp(
+                    (combined ** 1.5) * config["impact_factor"],
+                    0,
+                    1
+                )
+            else:
+                system_state[infra] = 0
+
+        total_system_stress = np.mean(list(system_state.values()))
+        return clamp(float(total_system_stress), 0, 1), system_state
+
+
+def enhanced_risk_with_cascade(row, outage_intensity, scenario_engine):
+    if isinstance(row, pd.Series):
+        row = row.to_dict()
+
+    scenario_row = scenario_engine.apply(row)
+    base = compute_multilayer_risk(scenario_row, outage_intensity)
+
+    graph = InfrastructureGraph()
+    system_stress, system_breakdown = graph.propagate_failure(
+        base["failure_probability"]
+    )
+
+    infra_multiplier = scenario_engine.params.get("infra", 1.0)
+    final_risk = clamp(base["risk_score"] * (1 + system_stress * infra_multiplier), 0, 100)
+
+    return {
+        **base,
+        "system_stress": round(float(system_stress), 3),
+        "final_risk_score": round(float(final_risk), 2),
+        "cascade_power": float(system_breakdown["power"]),
+        "cascade_water": float(system_breakdown["water"]),
+        "cascade_telecom": float(system_breakdown["telecom"]),
+        "cascade_transport": float(system_breakdown["transport"]),
+    }
+
+def run_time_simulation(row, outage_intensity, scenario_engine, hours=24):
+    timeline = []
+
+    for h in range(hours):
+        modified = dict(row)
+
+        modified["wind_speed_10m"] *= random.uniform(0.9, 1.2)
+        modified["precipitation"] *= random.uniform(0.8, 1.3)
+
+        risk = enhanced_risk_with_cascade(
+            modified,
+            outage_intensity * (1 + h / 24),
+            scenario_engine
+        )
+
+        timeline.append({
+            "hour": h,
+            "risk": risk["final_risk_score"],
+            "failure_prob": risk["failure_probability"],
+        })
+
+    return pd.DataFrame(timeline)
 
 def monte_carlo_risk(row, outage_intensity, simulations=30):
     scores = []
-    
-    for _ in range(simulations):
-        perturbed = row.copy()
-        perturbed["wind_speed_10m"] *= random.uniform(0.9,1.1)
-        perturbed["precipitation"] *= random.uniform(0.8,1.2)
-        
+    base_row = dict(row) if not isinstance(row, pd.Series) else row.to_dict()
+
+    for _ in range(int(simulations)):
+        perturbed = base_row.copy()
+        perturbed["wind_speed_10m"] = safe_float(perturbed.get("wind_speed_10m")) or 0
+        perturbed["precipitation"] = safe_float(perturbed.get("precipitation")) or 0
+
+        perturbed["wind_speed_10m"] *= random.uniform(0.9, 1.1)
+        perturbed["precipitation"] *= random.uniform(0.8, 1.2)
+
         risk = compute_multilayer_risk(perturbed, outage_intensity)
         scores.append(risk["risk_score"])
-    
+
     return {
-        "risk_std": np.std(scores),
-        "risk_p95": np.percentile(scores,95)
+        "risk_std": float(np.std(scores)) if scores else 0.0,
+        "risk_p95": float(np.percentile(scores, 95)) if scores else 0.0,
     }
+
 
 def combine_weather_air(place_name: str, lat: float, lon: float) -> Dict:
     weather = fetch_weather(lat, lon)
@@ -554,8 +725,16 @@ def combine_weather_air(place_name: str, lat: float, lon: float) -> Dict:
         "current_row": row,
     }
 
+def compound_hazard_index(row):
+    wind = safe_float(row.get("wind_speed_10m")) or 0
+    rain = safe_float(row.get("precipitation")) or 0
+    temp = safe_float(row.get("temperature_2m")) or 0
+
+    return (wind * rain) / 50 + abs(temp - 18) / 10
 
 def compute_location_risk(row: Dict, outage_intensity: float = 0.0) -> Dict:
+    row = ensure_scalar_dict(row)
+
     wind = safe_float(row.get("wind_speed_10m")) or 0
     cloud = safe_float(row.get("cloud_cover")) or 0
     rain = safe_float(row.get("precipitation")) or 0
@@ -593,11 +772,11 @@ def compute_location_risk(row: Dict, outage_intensity: float = 0.0) -> Dict:
     failure_probability = clamp(total / 100, 0, 1)
 
     return {
-        "risk_score": round(total, 1),
-        "outage_impact_score": round(impact, 1),
+        "risk_score": round(float(total), 1),
+        "outage_impact_score": round(float(impact), 1),
         "risk_label": label,
         "risk_colour": colour,
-        "failure_probability": round(failure_probability, 3),
+        "failure_probability": round(float(failure_probability), 3),
     }
 
 
@@ -639,7 +818,7 @@ def build_hourly_dataframe(weather_raw: Dict, air_raw: Dict) -> pd.DataFrame:
     return df
 
 
-def build_place_dataframe(region_name: str, outages_df: pd.DataFrame):
+def build_place_dataframe(region_name: str, outages_df: pd.DataFrame, simulations: int = 30):
     rows = []
     raw_cache = {}
 
@@ -647,7 +826,7 @@ def build_place_dataframe(region_name: str, outages_df: pd.DataFrame):
     for _, r in outages_df.iterrows():
         lat = safe_float(r.get("latitude"))
         lon = safe_float(r.get("longitude"))
-        if lat and lon:
+        if lat is not None and lon is not None:
             outage_points.append((lat, lon))
 
     for place, (lat, lon) in REGIONS[region_name]["places"].items():
@@ -659,15 +838,15 @@ def build_place_dataframe(region_name: str, outages_df: pd.DataFrame):
             if haversine_km(lat, lon, olat, olon) <= 25
         )
 
-        outage_intensity = clamp(nearby_outages/5,0,1)
+        outage_intensity = clamp(nearby_outages / 5, 0, 1)
 
         risk = compute_multilayer_risk(row, outage_intensity)
-        mc = monte_carlo_risk(row, outage_intensity)
+        mc = monte_carlo_risk(row, outage_intensity, simulations=simulations)
 
         row.update({
             "nearby_outages_25km": nearby_outages,
             **risk,
-            **mc
+            **mc,
         })
 
         rows.append(row)
@@ -681,10 +860,10 @@ def interpolate_weather_value(grid_lat, grid_lon, places_df: pd.DataFrame, col: 
     values = []
 
     for _, r in places_df.iterrows():
-        lat = r["lat"]
-        lon = r["lon"]
+        lat = safe_float(r.get("lat"))
+        lon = safe_float(r.get("lon"))
         value = safe_float(r.get(col))
-        if value is None:
+        if lat is None or lon is None or value is None:
             continue
         d = haversine_km(grid_lat, grid_lon, lat, lon)
         w = 1 / max(d, 1.0)
@@ -713,7 +892,25 @@ def count_outages_near(grid_lat, grid_lon, outages_df: pd.DataFrame, radius_km=2
     return total
 
 
-def build_digital_twin_grid(region_name: str, places_df: pd.DataFrame, outages_df: pd.DataFrame) -> pd.DataFrame:
+def get_risk_label(x):
+    x = safe_float(x)
+    if x is None:
+        return "Unknown"
+    if x >= 75:
+        return "Severe"
+    elif x >= 55:
+        return "High"
+    elif x >= 35:
+        return "Moderate"
+    return "Low"
+
+
+def build_digital_twin_grid(
+    region_name: str,
+    places_df: pd.DataFrame,
+    outages_df: pd.DataFrame,
+    scenario_engine=None,
+) -> pd.DataFrame:
     bbox = REGIONS[region_name]["bbox"]
     min_lon, min_lat, max_lon, max_lat = bbox
 
@@ -721,6 +918,7 @@ def build_digital_twin_grid(region_name: str, places_df: pd.DataFrame, outages_d
     lons = np.linspace(min_lon, max_lon, 12)
 
     cells = []
+
     for lat in lats:
         for lon in lons:
             wind = interpolate_weather_value(lat, lon, places_df, "wind_speed_10m")
@@ -732,41 +930,69 @@ def build_digital_twin_grid(region_name: str, places_df: pd.DataFrame, outages_d
             humidity = interpolate_weather_value(lat, lon, places_df, "relative_humidity_2m")
             temp = interpolate_weather_value(lat, lon, places_df, "temperature_2m")
             solar = interpolate_weather_value(lat, lon, places_df, "shortwave_radiation")
-            outages_near = count_outages_near(lat, lon, outages_df, radius_km=20)
 
-            risk = compute_multilayer_risk(
-                {
-                    "wind_speed_10m": wind,
-                    "cloud_cover": cloud,
-                    "precipitation": rain,
-                    "pm2_5": pm25,
-                    "nitrogen_dioxide": no2,
-                    "european_aqi": aqi,
-                    "relative_humidity_2m": humidity,
-                    "temperature_2m": temp,
-                },
-                outage_intensity=clamp(outages_near / 4, 0, 1),
-            )
+            outages_near = count_outages_near(lat, lon, outages_df, radius_km=20)
+            outage_intensity = clamp(outages_near / 4, 0, 1)
+
+            base_row = {
+                "wind_speed_10m": wind,
+                "cloud_cover": cloud,
+                "precipitation": rain,
+                "pm2_5": pm25,
+                "nitrogen_dioxide": no2,
+                "european_aqi": aqi,
+                "relative_humidity_2m": humidity,
+                "temperature_2m": temp,
+                "shortwave_radiation": solar,
+            }
+
+            if scenario_engine is not None:
+                enhanced = enhanced_risk_with_cascade(
+                    base_row,
+                    outage_intensity,
+                    scenario_engine,
+                )
+            else:
+                enhanced = compute_multilayer_risk(
+                    base_row,
+                    outage_intensity,
+                )
+                enhanced["system_stress"] = 0
+                enhanced["final_risk_score"] = enhanced["risk_score"]
+                enhanced["cascade_power"] = 0
+                enhanced["cascade_water"] = 0
+                enhanced["cascade_telecom"] = 0
+                enhanced["cascade_transport"] = 0
+
+            final_risk = enhanced.get("final_risk_score", enhanced.get("risk_score", 0))
+            final_risk = safe_float(final_risk) or 0
+            label = get_risk_label(final_risk)
 
             cells.append({
-                "lat": lat,
-                "lon": lon,
-                "wind_speed_10m": round(wind, 2),
-                "cloud_cover": round(cloud, 2),
-                "precipitation": round(rain, 2),
-                "pm2_5": round(pm25, 2),
-                "aqi": round(aqi, 2),
-                "temperature_2m": round(temp, 2),
-                "solar": round(solar, 2),
-                "outages_near_20km": outages_near,
-                **risk,
+                "lat": float(lat),
+                "lon": float(lon),
+                "wind_speed_10m": round(float(wind), 2),
+                "cloud_cover": round(float(cloud), 2),
+                "precipitation": round(float(rain), 2),
+                "pm2_5": round(float(pm25), 2),
+                "aqi": round(float(aqi), 2),
+                "temperature_2m": round(float(temp), 2),
+                "solar": round(float(solar), 2),
+                "outages_near_20km": int(outages_near),
+                "risk_score": safe_float(enhanced.get("risk_score", 0)) or 0,
+                "final_risk_score": round(float(final_risk), 2),
+                "system_stress": safe_float(enhanced.get("system_stress", 0)) or 0,
+                "failure_probability": safe_float(enhanced.get("failure_probability", 0)) or 0,
+                "cascade_power": safe_float(enhanced.get("cascade_power", 0)) or 0,
+                "cascade_water": safe_float(enhanced.get("cascade_water", 0)) or 0,
+                "cascade_telecom": safe_float(enhanced.get("cascade_telecom", 0)) or 0,
+                "cascade_transport": safe_float(enhanced.get("cascade_transport", 0)) or 0,
+                "risk_label": label,
             })
 
     return pd.DataFrame(cells)
 
-# =========================================================
-# UI
-# =========================================================
+
 st.title("North East & Yorkshire Grid Digital Twin")
 st.caption("Live digital twin for weather, pollution, solar conditions, satellite layers, outage monitoring and predictive risk screening.")
 
@@ -777,7 +1003,18 @@ with st.sidebar:
     selected_place = st.selectbox("Detailed forecast site", list(REGIONS[region_name]["places"].keys()), index=0)
     outage_limit = st.slider("Maximum live outage records to request", 10, 100, 100, 10)
     risk_filter = st.slider("Minimum risk level", 0, 100, 0)
-    
+    scenario_choice = st.selectbox(
+        "Simulation scenario",
+        [
+            "baseline",
+            "storm_cascade",
+            "flood_infrastructure",
+            "heatwave_peak",
+            "pollution_event",
+            "compound_extreme",
+        ],
+    )
+
     st.markdown("---")
     st.subheader("Auto refresh")
     st.write("This app refreshes automatically every 30 seconds.")
@@ -787,7 +1024,6 @@ with st.sidebar:
 
     mc_runs = st.slider("Monte Carlo simulations", 10, 100, 30)
     st.subheader("Digital twin logic")
-    
     st.write(
         """
         Risk score blends:
@@ -800,31 +1036,65 @@ with st.sidebar:
         """
     )
 
-# =========================================================
-# DATA LOAD
-# =========================================================
 try:
     raw_npg = fetch_npg_live_power_cuts(limit=outage_limit)
     raw_npg_df = payload_to_df(raw_npg)
     outages_df = standardise_outage_df(raw_npg_df, region_name)
 
-    places_df, raw_cache = build_place_dataframe(region_name, outages_df)
-    
-    places_df["risk_label"] = places_df["risk_score"].apply(
-    lambda x: "Severe" if x >= 75 else
-              "High" if x >= 55 else
-              "Moderate" if x >= 35 else
-              "Low"
+    places_df, raw_cache = build_place_dataframe(region_name, outages_df, simulations=mc_runs)
+    scenario_engine = ScenarioEngine(scenario_choice)
+
+    enhanced_rows = []
+    for _, r in places_df.iterrows():
+        enhanced = enhanced_risk_with_cascade(
+            r.to_dict(),
+            (safe_float(r.get("nearby_outages_25km")) or 0) / 5,
+            scenario_engine,
+        )
+        enhanced_rows.append(enhanced)
+
+    enhanced_df = pd.DataFrame(enhanced_rows)
+
+    enhanced_df = enhanced_df.add_prefix("enh_")
+
+    places_df = pd.concat(
+        [places_df.reset_index(drop=True), enhanced_df.reset_index(drop=True)],
+        axis=1,
     )
     
-    places_df["wind_speed_10m"] *= (1 + simulated_wind / 100)
-    
+    # overwrite with enhanced model outputs
+    places_df["risk_score"] = places_df["enh_risk_score"]
+    places_df["failure_probability"] = places_df["enh_failure_probability"]
+    places_df["net_load"] = places_df["enh_net_load"]
+    places_df["renewable_generation"] = places_df["enh_renewable_generation"]
+
+    for col in ["risk_score", "final_risk_score", "failure_probability"]:
+        if col in places_df.columns:
+            places_df[col] = places_df[col].apply(force_scalar)
+
+    if "risk_score" in places_df.columns:
+        places_df["risk_label"] = places_df["risk_score"].apply(get_risk_label)
+
+    if "wind_speed_10m" in places_df.columns:
+        places_df["wind_speed_10m"] = pd.to_numeric(places_df["wind_speed_10m"], errors="coerce").fillna(0)
+        places_df["wind_speed_10m"] *= (1 + simulated_wind / 100)
+
+    if "shortwave_radiation" not in places_df.columns:
+        places_df["shortwave_radiation"] = 0
+
     places_df["renewable_score"] = (
-        places_df["shortwave_radiation"].fillna(0) * 0.6 +
-        places_df["wind_speed_10m"].fillna(0) * 0.4)
-    digital_twin_df = build_digital_twin_grid(region_name, places_df, outages_df)
+        pd.to_numeric(places_df["shortwave_radiation"], errors="coerce").fillna(0) * 0.6
+        + pd.to_numeric(places_df["wind_speed_10m"], errors="coerce").fillna(0) * 0.4
+    )
+
+    digital_twin_df = build_digital_twin_grid(
+        region_name,
+        places_df,
+        outages_df,
+        scenario_engine,
+    )
     digital_twin_df = digital_twin_df[digital_twin_df["risk_score"] >= risk_filter]
-    
+
     selected_weather = raw_cache[selected_place]["weather_raw"]
     selected_air = raw_cache[selected_place]["air_raw"]
     selected_current = raw_cache[selected_place]["current_row"]
@@ -834,31 +1104,23 @@ except Exception as e:
     st.error(f"Data fetch failed: {e}")
     st.stop()
 
-# =========================================================
-# HEADLINE METRICS
-# =========================================================
-regional_risk = round(places_df["risk_score"].mean(), 1) if not places_df.empty else 0
-regional_failure_prob = round(places_df["failure_probability"].mean() * 100, 1) if not places_df.empty else 0
+regional_risk = round(float(places_df["risk_score"].mean()), 1) if not places_df.empty and "risk_score" in places_df.columns else 0
+regional_failure_prob = round(float(places_df["failure_probability"].mean()) * 100, 1) if not places_df.empty and "failure_probability" in places_df.columns else 0
 live_outages = len(outages_df)
 
 solar_value, solar_note = solar_interpretation(selected_current)
 
 m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
-m1.metric( "Regional risk",
-    regional_risk,
-    delta=f"{round(regional_risk - 50,1)} vs baseline")
+m1.metric("Regional risk", regional_risk, delta=f"{round(regional_risk - 50, 1)} vs baseline")
 m2.metric("Predicted failure probability", f"{regional_failure_prob}%")
 m3.metric("Live outage records", live_outages)
 m4.metric("Wind speed", f"{selected_current.get('wind_speed_10m', '—')} km/h")
 m5.metric("Solar radiation", solar_value)
 m6.metric("European AQI", f"{selected_current.get('european_aqi', '—')}")
-m7.metric("Renewable potential", round(places_df["renewable_score"].mean(), 1))
-m8.metric("Grid net load", round(places_df["net_load"].mean(),2))
+m7.metric("Renewable potential", round(float(places_df["renewable_score"].mean()), 1) if "renewable_score" in places_df.columns else 0)
+m8.metric("Grid net load", round(float(places_df["net_load"].mean()), 2) if "net_load" in places_df.columns else 0)
 st.info(solar_note)
 
-# =========================================================
-# RISK ALERT SYSTEM
-# =========================================================
 st.markdown("### ⚡ System Status")
 
 if regional_risk >= 70:
@@ -869,10 +1131,7 @@ elif regional_risk >= 35:
     st.info("Moderate operational conditions")
 else:
     st.success("System stable")
-    
-# =========================================================
-# TABS
-# =========================================================
+
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Digital Twin Map",
     "Regional Intelligence",
@@ -881,9 +1140,6 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Raw Twin Grid",
 ])
 
-# =========================================================
-# TAB 1: MAP
-# =========================================================
 with tab1:
     st.subheader(f"{region_name} live digital twin map")
 
@@ -965,12 +1221,14 @@ with tab1:
     if not digital_twin_df.empty:
         twin_df = digital_twin_df.copy()
         for _, row in twin_df.iterrows():
+            row = row.to_dict()
+
             lat = safe_float(row.get("lat"))
             lon = safe_float(row.get("lon"))
             if lat is None or lon is None:
                 continue
 
-            risk_score = safe_float(row.get("risk_score")) or 0
+            risk_score = safe_float(row.get("final_risk_score")) or 0
             risk_label = row.get("risk_label", "Unknown")
             wind = safe_float(row.get("wind_speed_10m"))
             aqi = safe_float(row.get("aqi"))
@@ -986,20 +1244,30 @@ with tab1:
             else:
                 colour = "green"
 
-            radius = 4 if risk_score < 35 else 6 if risk_score < 55 else 8
+            stress = safe_float(row.get("system_stress")) or 0
+
+            if stress > 0.7:
+                colour = "darkred"
+            elif stress > 0.5:
+                colour = "red"
+            elif stress > 0.3:
+                colour = "orange"
+            else:
+                colour = colour
 
             folium.CircleMarker(
                 location=[lat, lon],
-                radius=radius,
+                radius=10,
                 color=colour,
-                weight=1,
+                weight=2,
                 fill=True,
                 fill_color=colour,
-                fill_opacity=0.35,
+                fill_opacity=0.95,
                 popup=folium.Popup(
                     f"""
                     <b>Digital Twin Cell</b><br>
                     Risk score: {risk_score}<br>
+                    System stress: {round(stress, 2)}<br>
                     Risk label: {risk_label}<br>
                     Wind: {wind}<br>
                     AQI: {aqi}<br>
@@ -1013,12 +1281,13 @@ with tab1:
     if not places_df.empty:
         place_map_df = places_df.copy()
         for _, row in place_map_df.iterrows():
+            row = row.to_dict()
             lat = safe_float(row.get("lat"))
             lon = safe_float(row.get("lon"))
             if lat is None or lon is None:
                 continue
 
-            risk_score = safe_float(row.get("risk_score")) or 0
+            risk_score = safe_float(row.get("final_risk_score")) or 0
             failure_prob = safe_float(row.get("failure_probability")) or 0
             wind = safe_float(row.get("wind_speed_10m"))
             aqi = safe_float(row.get("european_aqi"))
@@ -1121,9 +1390,8 @@ with tab1:
     </div>
     """
     m.get_root().html.add_child(folium.Element(legend_html))
-    
-    st.caption("Click map markers to inspect local grid conditions")
 
+    st.caption("Click map markers to inspect local grid conditions")
     components.html(m._repr_html_(), height=700)
 
     c1, c2, c3 = st.columns(3)
@@ -1151,21 +1419,15 @@ with tab1:
         else:
             st.metric("Highest-risk place", "N/A")
 
-# =========================================================
-# TAB 2: REGIONAL INTELLIGENCE (STABLE VERSION)
-# =========================================================
 with tab2:
     st.subheader(f"{region_name} regional intelligence")
 
-    # -----------------------------------------------------
-    # KPI ROW
-    # -----------------------------------------------------
     k1, k2, k3, k4 = st.columns(4)
 
-    avg_risk = round(places_df.get("risk_score", pd.Series([0])).mean(), 1)
-    max_risk = round(places_df.get("risk_score", pd.Series([0])).max(), 1)
-    avg_aqi = round(places_df.get("european_aqi", pd.Series([0])).mean(), 1)
-    avg_wind = round(places_df.get("wind_speed_10m", pd.Series([0])).mean(), 1)
+    avg_risk = round(float(places_df.get("risk_score", pd.Series([0])).mean()), 1)
+    max_risk = round(float(places_df.get("risk_score", pd.Series([0])).max()), 1)
+    avg_aqi = round(float(places_df.get("european_aqi", pd.Series([0])).mean()), 1)
+    avg_wind = round(float(places_df.get("wind_speed_10m", pd.Series([0])).mean()), 1)
 
     k1.metric("Avg risk", avg_risk)
     k2.metric("Max risk", max_risk)
@@ -1174,9 +1436,6 @@ with tab2:
 
     st.markdown("---")
 
-    # -----------------------------------------------------
-    # MAIN TABLE + TOP AREAS
-    # -----------------------------------------------------
     left, right = st.columns([1.1, 1])
 
     with left:
@@ -1188,10 +1447,9 @@ with tab2:
             "european_aqi", "pm2_5",
             "nearby_outages_25km",
             "risk_score", "failure_probability",
-            "net_load", "renewable_generation"
+            "net_load", "renewable_generation",
         ]
 
-        # 🔥 CRASH-PROOF VERSION
         df_safe = places_df.reindex(columns=display_cols)
 
         if "risk_score" in df_safe.columns:
@@ -1212,21 +1470,15 @@ with tab2:
             top_places = places_df.head(5)
 
         for _, r in top_places.iterrows():
-
-            risk_score = r.get("risk_score", 0)
-
-            risk_label = (
-                "Severe" if risk_score >= 75 else
-                "High" if risk_score >= 55 else
-                "Moderate" if risk_score >= 35 else
-                "Low"
-            )
+            r = r.to_dict()
+            risk_score = safe_float(r.get("risk_score")) or 0
+            risk_label = get_risk_label(risk_score)
 
             st.markdown(
                 f"""
                 **{r.get('place', 'Unknown')}**
                 - Risk: **{risk_score} ({risk_label})**
-                - Failure probability: **{round(r.get('failure_probability', 0) * 100, 1)}%**
+                - Failure probability: **{round((safe_float(r.get('failure_probability')) or 0) * 100, 1)}%**
                 - Wind: {r.get('wind_speed_10m', '—')} km/h  
                 - AQI: {r.get('european_aqi', '—')}  
                 - Nearby outages: {r.get('nearby_outages_25km', 0)}
@@ -1234,10 +1486,23 @@ with tab2:
             )
 
     st.markdown("---")
+    st.markdown("### Cascading infrastructure stress")
 
-    # -----------------------------------------------------
-    # RISK TREND
-    # -----------------------------------------------------
+    if "system_stress" in places_df.columns:
+        plot_df = places_df[["place", "system_stress"]].copy()
+        plot_df["system_stress"] = pd.to_numeric(plot_df["system_stress"], errors="coerce").fillna(0)
+        st.bar_chart(plot_df.set_index("place")["system_stress"])
+
+    st.markdown("### Infrastructure breakdown")
+
+    for _, r in places_df.iterrows():
+        st.write(
+            f"{r['place']} → "
+            f"Power:{round(safe_float(r.get('cascade_power')) or 0, 2)} | "
+            f"Water:{round(safe_float(r.get('cascade_water')) or 0, 2)} | "
+            f"Telecom:{round(safe_float(r.get('cascade_telecom')) or 0, 2)}"
+        )
+
     st.markdown("### Predicted risk trend (next 24h)")
 
     if not hourly_df.empty and "predicted_risk_score" in hourly_df.columns:
@@ -1246,28 +1511,20 @@ with tab2:
         st.warning("No forecast data available.")
 
     st.markdown("---")
-
-    # -----------------------------------------------------
-    # RENEWABLE ENERGY
-    # -----------------------------------------------------
     st.markdown("### Renewable energy potential")
 
     if not places_df.empty:
         places_df["renewable_score"] = (
-            places_df.get("shortwave_radiation", 0).fillna(0) * 0.6 +
-            places_df.get("wind_speed_10m", 0).fillna(0) * 0.4
+            pd.to_numeric(places_df.get("shortwave_radiation", 0), errors="coerce").fillna(0) * 0.6
+            + pd.to_numeric(places_df.get("wind_speed_10m", 0), errors="coerce").fillna(0) * 0.4
         )
 
         st.metric(
             "Regional renewable potential",
-            round(places_df["renewable_score"].mean(), 1)
+            round(float(places_df["renewable_score"].mean()), 1),
         )
 
     st.markdown("---")
-
-    # -----------------------------------------------------
-    # SYSTEM INTERPRETATION
-    # -----------------------------------------------------
     st.markdown("### System interpretation")
 
     if avg_risk >= 70:
@@ -1280,10 +1537,6 @@ with tab2:
         st.success("Grid operating under stable environmental conditions.")
 
     st.markdown("---")
-
-    # -----------------------------------------------------
-    # AI INTERPRETATION
-    # -----------------------------------------------------
     st.markdown("### AI interpretation")
 
     if regional_risk > 60:
@@ -1294,10 +1547,6 @@ with tab2:
         st.write("Grid operating under stable environmental conditions.")
 
     st.markdown("---")
-
-    # -----------------------------------------------------
-    # SUMMARY TABLE
-    # -----------------------------------------------------
     st.markdown("### Regional digital twin summary")
 
     twin_summary = pd.DataFrame({
@@ -1311,29 +1560,40 @@ with tab2:
             "Live outages",
         ],
         "Value": [
-            round(digital_twin_df.get("risk_score", pd.Series([0])).mean(), 2),
-            round(digital_twin_df.get("risk_score", pd.Series([0])).max(), 2),
-            round(digital_twin_df.get("failure_probability", pd.Series([0])).mean() * 100, 2),
-            round(places_df.get("pm2_5", pd.Series([0])).mean(), 2),
-            round(places_df.get("wind_speed_10m", pd.Series([0])).mean(), 2),
-            round(places_df.get("shortwave_radiation", pd.Series([0])).mean(), 2),
+            round(float(digital_twin_df.get("risk_score", pd.Series([0])).mean()), 2),
+            round(float(digital_twin_df.get("risk_score", pd.Series([0])).max()), 2),
+            round(float(digital_twin_df.get("failure_probability", pd.Series([0])).mean()) * 100, 2),
+            round(float(places_df.get("pm2_5", pd.Series([0])).mean()), 2),
+            round(float(places_df.get("wind_speed_10m", pd.Series([0])).mean()), 2),
+            round(float(places_df.get("shortwave_radiation", pd.Series([0])).mean()), 2),
             len(outages_df),
         ],
     })
 
+
+    st.markdown("### ⏱️ Cascading failure timeline (CReDo style)")
+
+    if not places_df.empty:
+        sample_place = places_df.iloc[0].to_dict()
+
+        timeline_df = run_time_simulation(
+            sample_place,
+            outage_intensity=0.3,
+            scenario_engine=scenario_engine
+        )
+
+        st.line_chart(timeline_df.set_index("hour")[["risk"]])    
     st.markdown("### 🔬 Uncertainty (Monte Carlo)")
 
     for _, r in places_df.iterrows():
         st.write(
-            f"{r.get('place','Unknown')} → "
-            f"σ={round(r.get('risk_std',0),2)} | "
-            f"P95={round(r.get('risk_p95',0),1)}"
+            f"{r.get('place', 'Unknown')} → "
+            f"σ={round(safe_float(r.get('risk_std')) or 0, 2)} | "
+            f"P95={round(safe_float(r.get('risk_p95')) or 0, 1)}"
         )
 
     st.dataframe(twin_summary, use_container_width=True, hide_index=True)
-    
-# TAB 3: SELECTED SITE FORECAST
-# =========================================================
+
 with tab3:
     st.subheader(f"{selected_place} live and forecast diagnostics")
 
@@ -1368,7 +1628,7 @@ with tab3:
                 c for c in [
                     "time", "temperature_2m", "wind_speed_10m", "cloud_cover",
                     "precipitation", "shortwave_radiation", "european_aqi",
-                    "pm2_5", "predicted_risk_score"
+                    "pm2_5", "predicted_risk_score",
                 ]
                 if c in hourly_df.columns
             ]
@@ -1376,9 +1636,6 @@ with tab3:
         else:
             st.warning("No hourly forecast available.")
 
-# =========================================================
-# TAB 4: LIVE OUTAGES
-# =========================================================
 with tab4:
     st.subheader(f"Northern Powergrid live outage records — {region_name}")
 
@@ -1398,9 +1655,6 @@ with tab4:
             height=460,
         )
 
-# =========================================================
-# TAB 5: RAW TWIN GRID
-# =========================================================
 with tab5:
     csv = digital_twin_df.to_csv(index=False).encode("utf-8")
 
@@ -1408,9 +1662,9 @@ with tab5:
         "Download twin data",
         csv,
         "digital_twin.csv",
-        "text/csv"
+        "text/csv",
     )
-    
+
     st.subheader("Digital twin grid cells")
     st.dataframe(
         digital_twin_df.sort_values("risk_score", ascending=False),
