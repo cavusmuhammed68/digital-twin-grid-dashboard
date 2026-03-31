@@ -5,81 +5,126 @@ from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
-import pydeck as pdk
 import requests
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
+import streamlit.components.v1 as components
+import urllib3
+import folium
+from folium.plugins import HeatMap
+
+st.markdown("""
+<style>
+body {
+    background-color: #0e1117;
+}
+
+.block-container {
+    padding-top: 1rem;
+}
+
+[data-testid="stMetric"] {
+    background: rgba(255,255,255,0.05);
+    padding: 12px;
+    border-radius: 12px;
+    backdrop-filter: blur(8px);
+}
+
+.stTabs [role="tab"] {
+    font-size: 16px;
+    padding: 10px;
+}
+
+.stTabs [aria-selected="true"] {
+    background-color: rgba(255,255,255,0.1);
+    border-radius: 10px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# =========================================================
+# SSL / SESSION
+# =========================================================
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+session = requests.Session()
+session.verify = False
+session.headers.update({
+    "User-Agent": "north-east-yorkshire-digital-twin/3.0"
+})
 
 # =========================================================
 # PAGE CONFIG
 # =========================================================
 st.set_page_config(
-    page_title="North East & Yorkshire Digital Twin",
+    page_title="North East & Yorkshire Grid Digital Twin",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # =========================================================
-# CONSTANTS
+# OPTIONAL AUTO-REFRESH (30 SECONDS, NO EXTRA PACKAGE)
 # =========================================================
-SESSION = requests.Session()
-SESSION.headers.update(
-    {"User-Agent": "north-east-yorkshire-digital-twin/2.0"}
+components.html(
+    """
+    <script>
+        setTimeout(function() {
+            window.location.reload();
+        }, 30000);
+    </script>
+    """,
+    height=0,
 )
 
+# =========================================================
+# CONSTANTS
+# =========================================================
 NPG_DATASET_URL = (
     "https://northernpowergrid.opendatasoft.com/api/explore/v2.1/"
     "catalog/datasets/live-power-cuts-data/records"
 )
 
-WEATHER_CURRENT_VARS = ",".join(
-    [
-        "temperature_2m",
-        "apparent_temperature",
-        "wind_speed_10m",
-        "wind_direction_10m",
-        "surface_pressure",
-        "cloud_cover",
-        "shortwave_radiation",
-        "direct_radiation",
-        "diffuse_radiation",
-        "relative_humidity_2m",
-        "precipitation",
-        "is_day",
-    ]
-)
+WEATHER_CURRENT_VARS = ",".join([
+    "temperature_2m",
+    "apparent_temperature",
+    "wind_speed_10m",
+    "wind_direction_10m",
+    "surface_pressure",
+    "cloud_cover",
+    "shortwave_radiation",
+    "direct_radiation",
+    "diffuse_radiation",
+    "relative_humidity_2m",
+    "precipitation",
+    "is_day",
+])
 
-WEATHER_HOURLY_VARS = ",".join(
-    [
-        "temperature_2m",
-        "apparent_temperature",
-        "wind_speed_10m",
-        "wind_direction_10m",
-        "surface_pressure",
-        "cloud_cover",
-        "shortwave_radiation",
-        "direct_radiation",
-        "diffuse_radiation",
-        "relative_humidity_2m",
-        "precipitation",
-        "is_day",
-    ]
-)
+WEATHER_HOURLY_VARS = ",".join([
+    "temperature_2m",
+    "apparent_temperature",
+    "wind_speed_10m",
+    "wind_direction_10m",
+    "surface_pressure",
+    "cloud_cover",
+    "shortwave_radiation",
+    "direct_radiation",
+    "diffuse_radiation",
+    "relative_humidity_2m",
+    "precipitation",
+    "is_day",
+])
 
-AIR_CURRENT_VARS = ",".join(
-    [
-        "european_aqi",
-        "pm10",
-        "pm2_5",
-        "nitrogen_dioxide",
-        "ozone",
-        "sulphur_dioxide",
-        "carbon_monoxide",
-        "aerosol_optical_depth",
-        "dust",
-        "uv_index",
-    ]
-)
+AIR_CURRENT_VARS = ",".join([
+    "european_aqi",
+    "pm10",
+    "pm2_5",
+    "nitrogen_dioxide",
+    "ozone",
+    "sulphur_dioxide",
+    "carbon_monoxide",
+    "aerosol_optical_depth",
+    "dust",
+    "uv_index",
+])
 
 AIR_HOURLY_VARS = AIR_CURRENT_VARS
 
@@ -95,11 +140,10 @@ SATELLITE_LAYERS = {
     },
 }
 
-# Approximate region polygons for visual regional context
 REGIONS = {
     "North East": {
         "center": {"lat": 54.85, "lon": -1.65, "zoom": 7.5},
-        "bbox": [-3.35, 54.10, -0.60, 55.95],  # [min_lon, min_lat, max_lon, max_lat]
+        "bbox": [-3.35, 54.10, -0.60, 55.95],
         "polygon": [
             [-3.20, 55.80],
             [-2.50, 55.92],
@@ -121,22 +165,10 @@ REGIONS = {
             "Hexham": (54.9730, -2.1010),
         },
         "search_tokens": [
-            "newcastle",
-            "newcastle upon tyne",
-            "northumberland",
-            "sunderland",
-            "durham",
-            "county durham",
-            "teesside",
-            "middlesbrough",
-            "gateshead",
-            "south tyneside",
-            "north tyneside",
-            "darlington",
-            "hartlepool",
-            "stockton",
-            "redcar",
-            "tyne and wear",
+            "newcastle", "newcastle upon tyne", "northumberland", "sunderland",
+            "durham", "county durham", "teesside", "middlesbrough", "gateshead",
+            "south tyneside", "north tyneside", "darlington", "hartlepool",
+            "stockton", "redcar", "tyne and wear",
         ],
     },
     "Yorkshire": {
@@ -163,21 +195,9 @@ REGIONS = {
             "Doncaster": (53.5228, -1.1285),
         },
         "search_tokens": [
-            "yorkshire",
-            "leeds",
-            "sheffield",
-            "york",
-            "hull",
-            "bradford",
-            "wakefield",
-            "rotherham",
-            "doncaster",
-            "barnsley",
-            "huddersfield",
-            "harrogate",
-            "scarborough",
-            "halifax",
-            "east riding",
+            "yorkshire", "leeds", "sheffield", "york", "hull", "bradford",
+            "wakefield", "rotherham", "doncaster", "barnsley", "huddersfield",
+            "harrogate", "scarborough", "halifax", "east riding",
         ],
     },
 }
@@ -225,84 +245,66 @@ def solar_interpretation(current: Dict) -> Tuple[str, str]:
     solar = current.get("shortwave_radiation")
     is_day = current.get("is_day")
     cloud = current.get("cloud_cover")
+
     if solar is None:
         return "—", "Solar radiation not available."
+
     if is_day == 0:
         return f"{solar} W/m²", "It is currently night-time at this location, so near-zero solar radiation is physically expected."
+
     if cloud is not None and solar == 0:
         return f"{solar} W/m²", "Daytime zero solar radiation is unusual and may reflect transient API or observation conditions."
-    return f"{solar} W/m²", f"Daytime solar conditions. Cloud cover is {cloud}%."
 
+    return f"{solar} W/m²", f"Daytime solar conditions. Cloud cover is {cloud}%."
 
 # =========================================================
 # DATA ACCESS
 # =========================================================
 @st.cache_data(ttl=25, show_spinner=False)
 def fetch_weather(lat: float, lon: float) -> Dict:
-    url = (
-        "https://api.open-meteo.com/v1/forecast"
-        f"?latitude={lat}&longitude={lon}"
-        f"&current={WEATHER_CURRENT_VARS}"
-        f"&hourly={WEATHER_HOURLY_VARS}"
-        "&forecast_days=2"
-        "&timezone=Europe%2FLondon"
-    )
-    response = SESSION.get(url, timeout=30)
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": WEATHER_CURRENT_VARS,
+        "hourly": WEATHER_HOURLY_VARS,
+        "forecast_days": 2,
+        "timezone": "Europe/London",
+    }
+    response = session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=30)
     response.raise_for_status()
     return response.json()
 
 
 @st.cache_data(ttl=25, show_spinner=False)
 def fetch_air_quality(lat: float, lon: float) -> Dict:
-    url = (
-        "https://air-quality-api.open-meteo.com/v1/air-quality"
-        f"?latitude={lat}&longitude={lon}"
-        f"&current={AIR_CURRENT_VARS}"
-        f"&hourly={AIR_HOURLY_VARS}"
-        "&forecast_days=2"
-        "&timezone=Europe%2FLondon"
-    )
-    response = SESSION.get(url, timeout=30)
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": AIR_CURRENT_VARS,
+        "hourly": AIR_HOURLY_VARS,
+        "forecast_days": 2,
+        "timezone": "Europe/London",
+    }
+    response = session.get("https://air-quality-api.open-meteo.com/v1/air-quality", params=params, timeout=30)
     response.raise_for_status()
     return response.json()
 
 
 @st.cache_data(ttl=25, show_spinner=False)
-@st.cache_data(ttl=25, show_spinner=False)
-
 def fetch_npg_live_power_cuts(limit: int = 100) -> Dict:
-    """
-    Robust NPG fetch (handles API constraints)
-    """
-
-    # API LIMIT FIX
-    safe_limit = min(max(limit, 1), 100)
-
-    url = "https://northernpowergrid.opendatasoft.com/api/explore/v2.1/catalog/datasets/live-power-cuts-data/records"
-
-    params = {
-        "limit": safe_limit
-    }
+    safe_limit = min(max(int(limit), 1), 100)
+    params = {"limit": safe_limit}
 
     try:
-        response = requests.get(url, params=params, timeout=30)
-
-        if response.status_code != 200:
-            st.error(f"NPG API error: {response.status_code}")
-            st.code(response.text)
-            return {"results": []}
-
+        response = session.get(NPG_DATASET_URL, params=params, timeout=30)
+        response.raise_for_status()
         data = response.json()
-
-        # EXTRA SAFETY
         if "results" not in data:
-            st.warning("NPG returned unexpected format")
+            st.warning("NPG returned unexpected format.")
             return {"results": []}
-
         return data
-
     except Exception as e:
-        st.error(f"NPG fetch failed: {e}")
+        st.warning(f"NPG fetch failed: {e}")
         return {"results": []}
 
 
@@ -338,42 +340,26 @@ def region_filter_text(df: pd.DataFrame, region_name: str) -> pd.DataFrame:
     filtered = df[mask].copy()
     if filtered.empty:
         return df.copy()
+
     return filtered
 
 
 def standardise_outage_df(df: pd.DataFrame, region_name: str) -> pd.DataFrame:
-    """
-    Robust standardisation for Northern Powergrid outage dataset.
-    - Handles missing coordinates
-    - Auto-detects column names
-    - Applies geo + text fallback mapping
-    - Prevents crashes
-    """
-
     if df is None or df.empty:
         return pd.DataFrame()
 
     df = df.copy()
 
-    # -----------------------------------------------------
-    # 1. REGION TEXT FILTER (SAFE)
-    # -----------------------------------------------------
     try:
         df = region_filter_text(df, region_name)
     except Exception:
-        pass  # do not break pipeline
+        pass
 
-    # -----------------------------------------------------
-    # 2. ENSURE LAT/LON COLUMNS EXIST
-    # -----------------------------------------------------
     if "latitude" not in df.columns:
         df["latitude"] = np.nan
     if "longitude" not in df.columns:
         df["longitude"] = np.nan
 
-    # -----------------------------------------------------
-    # 3. AUTO-DETECT LAT/LON FROM ANY COLUMN
-    # -----------------------------------------------------
     lat_candidates = [c for c in df.columns if "lat" in c.lower()]
     lon_candidates = [c for c in df.columns if ("lon" in c.lower() or "lng" in c.lower())]
 
@@ -384,9 +370,6 @@ def standardise_outage_df(df: pd.DataFrame, region_name: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # -----------------------------------------------------
-    # 4. TEXT-BASED GEO FALLBACK (CITY MATCH)
-    # -----------------------------------------------------
     region_places = REGIONS.get(region_name, {}).get("places", {})
 
     try:
@@ -402,37 +385,23 @@ def standardise_outage_df(df: pd.DataFrame, region_name: str) -> pd.DataFrame:
         except Exception:
             continue
 
-    # -----------------------------------------------------
-    # 5. GEO FILTER (SAFE BBOX)
-    # -----------------------------------------------------
     bbox = REGIONS.get(region_name, {}).get("bbox", None)
-
-    if bbox and "latitude" in df.columns and "longitude" in df.columns:
+    if bbox is not None and "latitude" in df.columns and "longitude" in df.columns:
         try:
             geo_mask = df.apply(
                 lambda r: (
-                    pd.notna(r["latitude"]) and pd.notna(r["longitude"]) and
-                    point_in_bbox(
-                        float(r["latitude"]),
-                        float(r["longitude"]),
-                        bbox,
-                    )
+                    pd.notna(r["latitude"])
+                    and pd.notna(r["longitude"])
+                    and point_in_bbox(float(r["latitude"]), float(r["longitude"]), bbox)
                 ),
                 axis=1,
             )
-
             geo_filtered = df[geo_mask].copy()
-
-            # Only apply if not empty (avoid losing all data)
             if not geo_filtered.empty:
                 df = geo_filtered
-
         except Exception:
             pass
 
-    # -----------------------------------------------------
-    # 6. SAFE COLUMN EXTRACTION
-    # -----------------------------------------------------
     def safe_col(col_list):
         return col_list[0] if col_list else None
 
@@ -452,14 +421,11 @@ def standardise_outage_df(df: pd.DataFrame, region_name: str) -> pd.DataFrame:
     estimated_col = safe_col(possible_estimated)
     time_col = safe_col(possible_time)
 
-    # -----------------------------------------------------
-    # 7. CREATE CLEAN STANDARD FIELDS
-    # -----------------------------------------------------
     df["outage_reference"] = df[ref_col] if ref_col else "N/A"
     df["outage_status"] = df[status_col] if status_col else "Unknown"
     df["outage_category"] = df[category_col] if category_col else "Unknown"
     df["postcode_label"] = df[postcode_col] if postcode_col else ""
-    
+
     if customers_col:
         df["affected_customers"] = pd.to_numeric(df[customers_col], errors="coerce")
     else:
@@ -468,22 +434,84 @@ def standardise_outage_df(df: pd.DataFrame, region_name: str) -> pd.DataFrame:
     df["estimated_restore"] = df[estimated_col] if estimated_col else ""
     df["time_label"] = df[time_col] if time_col else ""
 
-    # -----------------------------------------------------
-    # 8. FINAL CLEANUP (IMPORTANT)
-    # -----------------------------------------------------
     df = df.reset_index(drop=True)
 
-    # Drop rows with no usable geo at all (optional but recommended)
     if "latitude" in df.columns and "longitude" in df.columns:
-        df = df[
-            df["latitude"].notna() & df["longitude"].notna()
-        ].copy()
+        df = df[df["latitude"].notna() & df["longitude"].notna()].copy()
 
     return df
 
 # =========================================================
 # FEATURE ENGINEERING
 # =========================================================
+
+# =========================================================
+# ADVANCED RISK ENGINE 
+# =========================================================
+import random
+
+def renewable_generation_model(row):
+    solar = safe_float(row.get("shortwave_radiation")) or 0
+    wind = safe_float(row.get("wind_speed_10m")) or 0
+    
+    solar_power = solar * 0.2
+    wind_power = min((wind / 12) ** 3, 1) * 100
+    
+    return solar_power + wind_power
+
+
+def ev_load_model(hour: int, base_load=1.0):
+    if 17 <= hour <= 22:
+        return base_load * 1.8
+    elif 0 <= hour <= 6:
+        return base_load * 0.6
+    return base_load
+
+
+def compute_multilayer_risk(row, outage_intensity=0.0, hour=12):
+    wind = safe_float(row.get("wind_speed_10m")) or 0
+    rain = safe_float(row.get("precipitation")) or 0
+    cloud = safe_float(row.get("cloud_cover")) or 0
+    pm25 = safe_float(row.get("pm2_5")) or 0
+    aqi = safe_float(row.get("european_aqi")) or 0
+
+    env = (wind/60)*0.4 + (rain/5)*0.2 + (cloud/100)*0.1 + (aqi/100)*0.3
+    infra = outage_intensity
+
+    ev_load = ev_load_model(hour)
+    renewable = renewable_generation_model(row)
+    net_load = ev_load*100 - renewable
+
+    operational = clamp(net_load/200, 0, 1)
+
+    total = (0.5*env + 0.3*infra + 0.2*operational)*100
+    total = clamp(total, 0, 100)
+
+    failure_prob = 1/(1+np.exp(-0.08*(total-50)))
+
+    return {
+        "risk_score": round(total,2),
+        "failure_probability": round(failure_prob,3),
+        "net_load": round(net_load,2),
+        "renewable_generation": round(renewable,2)
+    }
+
+def monte_carlo_risk(row, outage_intensity, simulations=30):
+    scores = []
+    
+    for _ in range(simulations):
+        perturbed = row.copy()
+        perturbed["wind_speed_10m"] *= random.uniform(0.9,1.1)
+        perturbed["precipitation"] *= random.uniform(0.8,1.2)
+        
+        risk = compute_multilayer_risk(perturbed, outage_intensity)
+        scores.append(risk["risk_score"])
+    
+    return {
+        "risk_std": np.std(scores),
+        "risk_p95": np.percentile(scores,95)
+    }
+
 def combine_weather_air(place_name: str, lat: float, lon: float) -> Dict:
     weather = fetch_weather(lat, lon)
     air = fetch_air_quality(lat, lon)
@@ -519,6 +547,7 @@ def combine_weather_air(place_name: str, lat: float, lon: float) -> Dict:
         "dust": current_a.get("dust"),
         "uv_index": current_a.get("uv_index"),
     }
+
     return {
         "weather_raw": weather,
         "air_raw": air,
@@ -543,6 +572,7 @@ def compute_location_risk(row: Dict, outage_intensity: float = 0.0) -> Dict:
     humidity_score = clamp((humidity / 100) * 5, 0, 5)
     thermal_score = clamp(abs(temp - 18) / 18 * 5, 0, 5)
     outage_score = clamp(outage_intensity * 10, 0, 10)
+    impact = outage_intensity * 100
 
     total = wind_score + rain_score + cloud_score + air_score + humidity_score + thermal_score + outage_score
     total = clamp(total, 0, 100)
@@ -564,6 +594,7 @@ def compute_location_risk(row: Dict, outage_intensity: float = 0.0) -> Dict:
 
     return {
         "risk_score": round(total, 1),
+        "outage_impact_score": round(impact, 1),
         "risk_label": label,
         "risk_colour": colour,
         "failure_probability": round(failure_probability, 3),
@@ -584,7 +615,10 @@ def build_hourly_dataframe(weather_raw: Dict, air_raw: Dict) -> pd.DataFrame:
     else:
         df = a.copy()
 
-    for col in ["wind_speed_10m", "precipitation", "cloud_cover", "pm2_5", "nitrogen_dioxide", "european_aqi", "relative_humidity_2m", "temperature_2m"]:
+    for col in [
+        "wind_speed_10m", "precipitation", "cloud_cover", "pm2_5",
+        "nitrogen_dioxide", "european_aqi", "relative_humidity_2m", "temperature_2m"
+    ]:
         if col not in df.columns:
             df[col] = 0
 
@@ -599,42 +633,43 @@ def build_hourly_dataframe(weather_raw: Dict, air_raw: Dict) -> pd.DataFrame:
             "relative_humidity_2m": r.get("relative_humidity_2m", 0),
             "temperature_2m": r.get("temperature_2m", 0),
         }
-        return compute_location_risk(temp_row, outage_intensity=0)["risk_score"]
+        return compute_multilayer_risk(temp_row, outage_intensity=0)["risk_score"]
 
     df["predicted_risk_score"] = df.apply(hourly_risk, axis=1)
     return df
 
 
-def build_place_dataframe(region_name: str, outages_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
+def build_place_dataframe(region_name: str, outages_df: pd.DataFrame):
     rows = []
     raw_cache = {}
 
     outage_points = []
-    if not outages_df.empty:
-        for _, r in outages_df.iterrows():
-            lat = safe_float(r.get("latitude"))
-            lon = safe_float(r.get("longitude"))
-            if lat is not None and lon is not None:
-                outage_points.append((lat, lon))
+    for _, r in outages_df.iterrows():
+        lat = safe_float(r.get("latitude"))
+        lon = safe_float(r.get("longitude"))
+        if lat and lon:
+            outage_points.append((lat, lon))
 
     for place, (lat, lon) in REGIONS[region_name]["places"].items():
         combined = combine_weather_air(place, lat, lon)
         row = combined["current_row"]
 
-        nearby_outages = 0
-        for olat, olon in outage_points:
-            if haversine_km(lat, lon, olat, olon) <= 25:
-                nearby_outages += 1
-
-        outage_intensity = clamp(nearby_outages / 5, 0, 1)
-        risk = compute_location_risk(row, outage_intensity=outage_intensity)
-
-        row.update(
-            {
-                "nearby_outages_25km": nearby_outages,
-                **risk,
-            }
+        nearby_outages = sum(
+            1 for olat, olon in outage_points
+            if haversine_km(lat, lon, olat, olon) <= 25
         )
+
+        outage_intensity = clamp(nearby_outages/5,0,1)
+
+        risk = compute_multilayer_risk(row, outage_intensity)
+        mc = monte_carlo_risk(row, outage_intensity)
+
+        row.update({
+            "nearby_outages_25km": nearby_outages,
+            **risk,
+            **mc
+        })
+
         rows.append(row)
         raw_cache[place] = combined
 
@@ -674,6 +709,7 @@ def count_outages_near(grid_lat, grid_lon, outages_df: pd.DataFrame, radius_km=2
             continue
         if haversine_km(grid_lat, grid_lon, olat, olon) <= radius_km:
             total += 1
+
     return total
 
 
@@ -681,11 +717,8 @@ def build_digital_twin_grid(region_name: str, places_df: pd.DataFrame, outages_d
     bbox = REGIONS[region_name]["bbox"]
     min_lon, min_lat, max_lon, max_lat = bbox
 
-    lat_steps = 12
-    lon_steps = 12
-
-    lats = np.linspace(min_lat, max_lat, lat_steps)
-    lons = np.linspace(min_lon, max_lon, lon_steps)
+    lats = np.linspace(min_lat, max_lat, 12)
+    lons = np.linspace(min_lon, max_lon, 12)
 
     cells = []
     for lat in lats:
@@ -701,7 +734,7 @@ def build_digital_twin_grid(region_name: str, places_df: pd.DataFrame, outages_d
             solar = interpolate_weather_value(lat, lon, places_df, "shortwave_radiation")
             outages_near = count_outages_near(lat, lon, outages_df, radius_km=20)
 
-            risk = compute_location_risk(
+            risk = compute_multilayer_risk(
                 {
                     "wind_speed_10m": wind,
                     "cloud_cover": cloud,
@@ -715,34 +748,27 @@ def build_digital_twin_grid(region_name: str, places_df: pd.DataFrame, outages_d
                 outage_intensity=clamp(outages_near / 4, 0, 1),
             )
 
-            cells.append(
-                {
-                    "lat": lat,
-                    "lon": lon,
-                    "wind_speed_10m": round(wind, 2),
-                    "cloud_cover": round(cloud, 2),
-                    "precipitation": round(rain, 2),
-                    "pm2_5": round(pm25, 2),
-                    "aqi": round(aqi, 2),
-                    "temperature_2m": round(temp, 2),
-                    "solar": round(solar, 2),
-                    "outages_near_20km": outages_near,
-                    **risk,
-                }
-            )
+            cells.append({
+                "lat": lat,
+                "lon": lon,
+                "wind_speed_10m": round(wind, 2),
+                "cloud_cover": round(cloud, 2),
+                "precipitation": round(rain, 2),
+                "pm2_5": round(pm25, 2),
+                "aqi": round(aqi, 2),
+                "temperature_2m": round(temp, 2),
+                "solar": round(solar, 2),
+                "outages_near_20km": outages_near,
+                **risk,
+            })
 
     return pd.DataFrame(cells)
-
 
 # =========================================================
 # UI
 # =========================================================
-st_autorefresh(interval=30 * 1000, key="auto_refresh_30s")
-
 st.title("North East & Yorkshire Grid Digital Twin")
-st.caption(
-    "Live digital twin for weather, pollution, solar conditions, satellite layers, outage monitoring and predictive risk screening."
-)
+st.caption("Live digital twin for weather, pollution, solar conditions, satellite layers, outage monitoring and predictive risk screening.")
 
 with st.sidebar:
     st.header("Controls")
@@ -750,12 +776,18 @@ with st.sidebar:
     satellite_name = st.selectbox("Satellite layer", list(SATELLITE_LAYERS.keys()), index=0)
     selected_place = st.selectbox("Detailed forecast site", list(REGIONS[region_name]["places"].keys()), index=0)
     outage_limit = st.slider("Maximum live outage records to request", 10, 100, 100, 10)
+    risk_filter = st.slider("Minimum risk level", 0, 100, 0)
+    
     st.markdown("---")
     st.subheader("Auto refresh")
     st.write("This app refreshes automatically every 30 seconds.")
 
     st.markdown("---")
+    simulated_wind = st.slider("Simulate wind increase (%)", 0, 100, 0)
+
+    mc_runs = st.slider("Monte Carlo simulations", 10, 100, 30)
     st.subheader("Digital twin logic")
+    
     st.write(
         """
         Risk score blends:
@@ -777,9 +809,14 @@ try:
     outages_df = standardise_outage_df(raw_npg_df, region_name)
 
     places_df, raw_cache = build_place_dataframe(region_name, outages_df)
+    places_df["wind_speed_10m"] *= (1 + simulated_wind / 100)
+    
+    places_df["renewable_score"] = (
+        places_df["shortwave_radiation"].fillna(0) * 0.6 +
+        places_df["wind_speed_10m"].fillna(0) * 0.4)
     digital_twin_df = build_digital_twin_grid(region_name, places_df, outages_df)
-
-    selected_lat, selected_lon = REGIONS[region_name]["places"][selected_place]
+    digital_twin_df = digital_twin_df[digital_twin_df["risk_score"] >= risk_filter]
+    
     selected_weather = raw_cache[selected_place]["weather_raw"]
     selected_air = raw_cache[selected_place]["air_raw"]
     selected_current = raw_cache[selected_place]["current_row"]
@@ -798,44 +835,52 @@ live_outages = len(outages_df)
 
 solar_value, solar_note = solar_interpretation(selected_current)
 
-m1, m2, m3, m4, m5, m6 = st.columns(6)
-m1.metric("Regional risk score", regional_risk)
+m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
+m1.metric( "Regional risk",
+    regional_risk,
+    delta=f"{round(regional_risk - 50,1)} vs baseline")
 m2.metric("Predicted failure probability", f"{regional_failure_prob}%")
 m3.metric("Live outage records", live_outages)
 m4.metric("Wind speed", f"{selected_current.get('wind_speed_10m', '—')} km/h")
 m5.metric("Solar radiation", solar_value)
 m6.metric("European AQI", f"{selected_current.get('european_aqi', '—')}")
-
+m7.metric("Renewable potential", round(places_df["renewable_score"].mean(), 1))
+m8.metric("Grid net load", round(places_df["net_load"].mean(),2))
 st.info(solar_note)
 
 # =========================================================
+# RISK ALERT SYSTEM
+# =========================================================
+st.markdown("### ⚡ System Status")
+
+if regional_risk >= 70:
+    st.error("CRITICAL GRID RISK — Immediate action required")
+elif regional_risk >= 55:
+    st.warning("Elevated grid stress detected")
+elif regional_risk >= 35:
+    st.info("Moderate operational conditions")
+else:
+    st.success("System stable")
+    
+# =========================================================
 # TABS
 # =========================================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    [
-        "Digital Twin Map",
-        "Regional Intelligence",
-        "Selected Site Forecast",
-        "Live Outages",
-        "Raw Twin Grid",
-    ]
-)
-
-import folium
-from folium.plugins import HeatMap
-from streamlit_folium import st_folium
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Digital Twin Map",
+    "Regional Intelligence",
+    "Selected Site Forecast",
+    "Live Outages",
+    "Raw Twin Grid",
+])
 
 # =========================================================
-# TAB 1: MAP (FOLIUM + MORE MAP-LIKE DIGITAL TWIN)
+# TAB 1: MAP
 # =========================================================
 with tab1:
     st.subheader(f"{region_name} live digital twin map")
 
     center = REGIONS[region_name]["center"]
 
-    # -----------------------------------------------------
-    # 1. CREATE BASE MAP
-    # -----------------------------------------------------
     base_tiles = {
         "Satellite-style dark": "CartoDB dark_matter",
         "Light": "CartoDB positron",
@@ -857,9 +902,6 @@ with tab1:
         control_scale=True,
     )
 
-    # -----------------------------------------------------
-    # 2. OPTIONAL NASA SATELLITE OVERLAY
-    # -----------------------------------------------------
     try:
         tile_url = get_satellite_tile_url(satellite_name)
         folium.raster_layers.TileLayer(
@@ -873,14 +915,7 @@ with tab1:
     except Exception:
         st.warning("Satellite layer failed to load.")
 
-    # -----------------------------------------------------
-    # 3. REGION POLYGON
-    # REGIONS polygon format is [lon, lat], folium needs [lat, lon]
-    # -----------------------------------------------------
-    region_polygon_latlon = [
-        [lat, lon] for lon, lat in REGIONS[region_name]["polygon"]
-    ]
-
+    region_polygon_latlon = [[lat, lon] for lon, lat in REGIONS[region_name]["polygon"]]
     folium.Polygon(
         locations=region_polygon_latlon,
         color="orange",
@@ -891,9 +926,6 @@ with tab1:
         popup=f"{region_name} region boundary",
     ).add_to(m)
 
-    # -----------------------------------------------------
-    # 4. DIGITAL TWIN HEATMAP
-    # -----------------------------------------------------
     if not digital_twin_df.empty:
         twin_df = digital_twin_df.copy()
 
@@ -922,12 +954,8 @@ with tab1:
                 max_zoom=12,
             ).add_to(m)
 
-    # -----------------------------------------------------
-    # 5. DIGITAL TWIN GRID CELLS / RISK NODES
-    # -----------------------------------------------------
     if not digital_twin_df.empty:
         twin_df = digital_twin_df.copy()
-
         for _, row in twin_df.iterrows():
             lat = safe_float(row.get("lat"))
             lon = safe_float(row.get("lon"))
@@ -974,12 +1002,8 @@ with tab1:
                 ),
             ).add_to(m)
 
-    # -----------------------------------------------------
-    # 6. REPRESENTATIVE PLACE NODES
-    # -----------------------------------------------------
     if not places_df.empty:
         place_map_df = places_df.copy()
-
         for _, row in place_map_df.iterrows():
             lat = safe_float(row.get("lat"))
             lon = safe_float(row.get("lon"))
@@ -1026,26 +1050,16 @@ with tab1:
                 tooltip=f"{place} | Risk {risk_score}",
             ).add_to(m)
 
-    # -----------------------------------------------------
-    # 7. LIVE OUTAGE POINTS (CRASH-PROOF)
-    # -----------------------------------------------------
     outage_points_df = pd.DataFrame()
-
     if (
         not outages_df.empty
         and "latitude" in outages_df.columns
         and "longitude" in outages_df.columns
     ):
         outage_points_df = outages_df.copy()
-        outage_points_df["latitude"] = pd.to_numeric(
-            outage_points_df["latitude"], errors="coerce"
-        )
-        outage_points_df["longitude"] = pd.to_numeric(
-            outage_points_df["longitude"], errors="coerce"
-        )
-        outage_points_df = outage_points_df.dropna(
-            subset=["latitude", "longitude"]
-        ).copy()
+        outage_points_df["latitude"] = pd.to_numeric(outage_points_df["latitude"], errors="coerce")
+        outage_points_df["longitude"] = pd.to_numeric(outage_points_df["longitude"], errors="coerce")
+        outage_points_df = outage_points_df.dropna(subset=["latitude", "longitude"]).copy()
 
     if not outage_points_df.empty:
         outage_layer = folium.FeatureGroup(name="Live outages", show=True)
@@ -1056,35 +1070,25 @@ with tab1:
             if lat is None or lon is None:
                 continue
 
-            outage_reference = row.get("outage_reference", "N/A")
-            outage_status = row.get("outage_status", "Unknown")
-            outage_category = row.get("outage_category", "Unknown")
-            affected_customers = row.get("affected_customers", "")
-            estimated_restore = row.get("estimated_restore", "")
-            postcode_label = row.get("postcode_label", "")
-
             popup_html = f"""
             <b>Power outage</b><br>
-            Reference: {outage_reference}<br>
-            Status: {outage_status}<br>
-            Category: {outage_category}<br>
-            Customers affected: {affected_customers}<br>
-            Postcode: {postcode_label}<br>
-            Estimated restore: {estimated_restore}
+            Reference: {row.get('outage_reference', 'N/A')}<br>
+            Status: {row.get('outage_status', 'Unknown')}<br>
+            Category: {row.get('outage_category', 'Unknown')}<br>
+            Customers affected: {row.get('affected_customers', '')}<br>
+            Postcode: {row.get('postcode_label', '')}<br>
+            Estimated restore: {row.get('estimated_restore', '')}
             """
 
             folium.Marker(
                 location=[lat, lon],
                 popup=folium.Popup(popup_html, max_width=340),
-                tooltip=f"Outage | {outage_status}",
+                tooltip=f"Outage | {row.get('outage_status', 'Unknown')}",
                 icon=folium.Icon(color="red", icon="flash", prefix="glyphicon"),
             ).add_to(outage_layer)
 
         outage_layer.add_to(m)
 
-    # -----------------------------------------------------
-    # 8. ADD MAP LEGEND / CONTROLS
-    # -----------------------------------------------------
     folium.LayerControl(collapsed=False).add_to(m)
 
     legend_html = """
@@ -1109,21 +1113,11 @@ with tab1:
     </div>
     """
     m.get_root().html.add_child(folium.Element(legend_html))
+    
+    st.caption("Click map markers to inspect local grid conditions")
 
-    # -----------------------------------------------------
-    # 9. RENDER MAP
-    # -----------------------------------------------------
-    st_folium(
-        m,
-        width=None,
-        height=700,
-        returned_objects=[],
-        use_container_width=True,
-    )
+    components.html(m._repr_html_(), height=700)
 
-    # -----------------------------------------------------
-    # 10. SUMMARY METRICS
-    # -----------------------------------------------------
     c1, c2, c3 = st.columns(3)
 
     with c1:
@@ -1144,80 +1138,170 @@ with tab1:
 
     with c3:
         if not places_df.empty and "risk_score" in places_df.columns:
-            worst_place = places_df.sort_values(
-                "risk_score", ascending=False
-            ).iloc[0]["place"]
+            worst_place = places_df.sort_values("risk_score", ascending=False).iloc[0]["place"]
             st.metric("Highest-risk place", worst_place)
         else:
             st.metric("Highest-risk place", "N/A")
 
 # =========================================================
-# TAB 2: REGIONAL INTELLIGENCE
+# TAB 2: REGIONAL INTELLIGENCE (UPGRADED)
 # =========================================================
 with tab2:
     st.subheader(f"{region_name} regional intelligence")
 
+    # -----------------------------------------------------
+    # KPI ROW (NEW)
+    # -----------------------------------------------------
+    k1, k2, k3, k4 = st.columns(4)
+
+    avg_risk = round(places_df["risk_score"].mean(), 1) if not places_df.empty else 0
+    max_risk = round(places_df["risk_score"].max(), 1) if not places_df.empty else 0
+    avg_aqi = round(places_df["european_aqi"].mean(), 1) if not places_df.empty else 0
+    avg_wind = round(places_df["wind_speed_10m"].mean(), 1) if not places_df.empty else 0
+
+    with k1:
+        st.metric("Avg risk", avg_risk)
+    with k2:
+        st.metric("Max risk", max_risk)
+    with k3:
+        st.metric("Avg AQI", avg_aqi)
+    with k4:
+        st.metric("Avg wind (km/h)", avg_wind)
+
+    st.markdown("---")
+
+    # -----------------------------------------------------
+    # MAIN TABLE + TOP AREAS
+    # -----------------------------------------------------
     left, right = st.columns([1.1, 1])
 
     with left:
         st.markdown("### Representative location risk table")
+
         display_cols = [
-            "place",
-            "temperature_2m",
-            "wind_speed_10m",
-            "wind_direction_10m",
-            "shortwave_radiation",
-            "cloud_cover",
-            "precipitation",
-            "european_aqi",
-            "pm2_5",
+            "place", "temperature_2m", "wind_speed_10m",
+            "shortwave_radiation", "cloud_cover", "precipitation",
+            "european_aqi", "pm2_5",
             "nearby_outages_25km",
-            "risk_score",
-            "risk_label",
-            "failure_probability",
+            "risk_score", "risk_label", "failure_probability",
         ]
+
         st.dataframe(
-            places_df[display_cols].sort_values("risk_score", ascending=False),
+            places_df[display_cols]
+            .sort_values("risk_score", ascending=False),
             use_container_width=True,
             height=320,
         )
 
     with right:
         st.markdown("### Top vulnerable areas")
+
         top_places = places_df.sort_values("risk_score", ascending=False).head(5)
+
         for _, r in top_places.iterrows():
-            st.write(
-                f"**{r['place']}** — Risk {r['risk_score']} ({r['risk_label']}), "
-                f"failure probability {round(r['failure_probability'] * 100, 1)}%, "
-                f"wind {r['wind_speed_10m']} km/h, AQI {r['european_aqi']}, "
-                f"nearby outages {r['nearby_outages_25km']}"
+            st.markdown(
+                f"""
+                **{r['place']}**
+                - Risk: **{r['risk_score']} ({r['risk_label']})**
+                - Failure probability: **{round(r['failure_probability'] * 100, 1)}%**
+                - Wind: {r['wind_speed_10m']} km/h  
+                - AQI: {r['european_aqi']}  
+                - Nearby outages: {r['nearby_outages_25km']}
+                """
             )
 
-    st.markdown("### Regional digital twin summary")
-    twin_summary = pd.DataFrame(
-        {
-            "Metric": [
-                "Average risk score",
-                "Maximum risk score",
-                "Average predicted failure probability",
-                "Mean PM2.5",
-                "Mean wind speed",
-                "Mean solar radiation",
-                "Live outages in region filter",
-            ],
-            "Value": [
-                round(digital_twin_df["risk_score"].mean(), 2) if not digital_twin_df.empty else 0,
-                round(digital_twin_df["risk_score"].max(), 2) if not digital_twin_df.empty else 0,
-                round(digital_twin_df["failure_probability"].mean() * 100, 2) if not digital_twin_df.empty else 0,
-                round(places_df["pm2_5"].mean(), 2) if not places_df.empty else 0,
-                round(places_df["wind_speed_10m"].mean(), 2) if not places_df.empty else 0,
-                round(places_df["shortwave_radiation"].mean(), 2) if not places_df.empty else 0,
-                len(outages_df),
-            ],
-        }
-    )
-    st.dataframe(twin_summary, use_container_width=True, hide_index=True)
+    st.markdown("---")
 
+    # -----------------------------------------------------
+    # RISK TREND (NEW 🔥)
+    # -----------------------------------------------------
+    st.markdown("### Predicted risk trend (next 24h)")
+
+    if not hourly_df.empty:
+        st.line_chart(hourly_df["predicted_risk_score"])
+    else:
+        st.warning("No forecast data available.")
+
+    st.markdown("---")
+
+    # -----------------------------------------------------
+    # RENEWABLE ENERGY POTENTIAL (NEW ⚡)
+    # -----------------------------------------------------
+    st.markdown("### Renewable energy potential")
+
+    if not places_df.empty:
+        places_df["renewable_score"] = (
+            places_df["shortwave_radiation"].fillna(0) * 0.6 +
+            places_df["wind_speed_10m"].fillna(0) * 0.4
+        )
+
+        st.metric(
+            "Regional renewable potential",
+            round(places_df["renewable_score"].mean(), 1)
+        )
+
+    st.markdown("---")
+
+    # -----------------------------------------------------
+    # AI INTERPRETATION (NEW 🧠)
+    # -----------------------------------------------------
+    st.markdown("### System interpretation")
+
+    if avg_risk >= 70:
+        st.error("Critical grid stress driven by extreme environmental conditions and outage clustering.")
+    elif avg_risk >= 55:
+        st.warning("Elevated grid stress due to combined wind, pollution and outage activity.")
+    elif avg_risk >= 35:
+        st.info("Moderate stress levels with localised vulnerabilities.")
+    else:
+        st.success("Grid operating under stable environmental conditions.")
+
+    st.markdown("---")
+    
+    # -----------------------------------------------------
+    # AI INTERPRETATION
+    # -----------------------------------------------------
+    st.markdown("### AI interpretation")
+
+    if regional_risk > 60:
+        st.write("High wind and pollution levels are driving elevated grid stress.")
+    elif regional_risk > 40:
+        st.write("Moderate environmental stress observed across the region.")
+    else:
+        st.write("Grid operating under stable environmental conditions.")
+
+    st.markdown("---")
+
+    # -----------------------------------------------------
+    # SUMMARY TABLE (CLEANED)
+    # -----------------------------------------------------
+    st.markdown("### Regional digital twin summary")
+
+    twin_summary = pd.DataFrame({
+        "Metric": [
+            "Average risk score",
+            "Maximum risk score",
+            "Average predicted failure probability",
+            "Mean PM2.5",
+            "Mean wind speed",
+            "Mean solar radiation",
+            "Live outages",
+        ],
+        "Value": [
+            round(digital_twin_df["risk_score"].mean(), 2) if not digital_twin_df.empty else 0,
+            round(digital_twin_df["risk_score"].max(), 2) if not digital_twin_df.empty else 0,
+            round(digital_twin_df["failure_probability"].mean() * 100, 2) if not digital_twin_df.empty else 0,
+            round(places_df["pm2_5"].mean(), 2) if not places_df.empty else 0,
+            round(places_df["wind_speed_10m"].mean(), 2) if not places_df.empty else 0,
+            round(places_df["shortwave_radiation"].mean(), 2) if not places_df.empty else 0,
+            len(outages_df),
+        ],
+    })
+    st.markdown("### 🔬 Uncertainty (Monte Carlo)")
+
+    for _, r in places_df.iterrows():
+        st.write(f"{r['place']} → σ={round(r['risk_std'],2)} | P95={round(r['risk_p95'],1)}")
+    st.dataframe(twin_summary, use_container_width=True, hide_index=True)
 # =========================================================
 # TAB 3: SELECTED SITE FORECAST
 # =========================================================
@@ -1228,42 +1312,34 @@ with tab3:
 
     with lc1:
         st.markdown("### Current conditions")
-        st.json(
-            {
-                "time": selected_current.get("time"),
-                "temperature_2m": selected_current.get("temperature_2m"),
-                "apparent_temperature": selected_current.get("apparent_temperature"),
-                "wind_speed_10m": selected_current.get("wind_speed_10m"),
-                "wind_direction_10m": selected_current.get("wind_direction_10m"),
-                "cloud_cover": selected_current.get("cloud_cover"),
-                "precipitation": selected_current.get("precipitation"),
-                "shortwave_radiation": selected_current.get("shortwave_radiation"),
-                "direct_radiation": selected_current.get("direct_radiation"),
-                "diffuse_radiation": selected_current.get("diffuse_radiation"),
-                "is_day": selected_current.get("is_day"),
-                "AQI": selected_current.get("european_aqi"),
-                "pm2_5": selected_current.get("pm2_5"),
-                "pm10": selected_current.get("pm10"),
-                "NO2": selected_current.get("nitrogen_dioxide"),
-                "O3": selected_current.get("ozone"),
-                "AOD": selected_current.get("aerosol_optical_depth"),
-            }
-        )
+        st.json({
+            "time": selected_current.get("time"),
+            "temperature_2m": selected_current.get("temperature_2m"),
+            "apparent_temperature": selected_current.get("apparent_temperature"),
+            "wind_speed_10m": selected_current.get("wind_speed_10m"),
+            "wind_direction_10m": selected_current.get("wind_direction_10m"),
+            "cloud_cover": selected_current.get("cloud_cover"),
+            "precipitation": selected_current.get("precipitation"),
+            "shortwave_radiation": selected_current.get("shortwave_radiation"),
+            "direct_radiation": selected_current.get("direct_radiation"),
+            "diffuse_radiation": selected_current.get("diffuse_radiation"),
+            "is_day": selected_current.get("is_day"),
+            "AQI": selected_current.get("european_aqi"),
+            "pm2_5": selected_current.get("pm2_5"),
+            "pm10": selected_current.get("pm10"),
+            "NO2": selected_current.get("nitrogen_dioxide"),
+            "O3": selected_current.get("ozone"),
+            "AOD": selected_current.get("aerosol_optical_depth"),
+        })
 
     with lc2:
         st.markdown("### 48-hour predictive outlook")
         if not hourly_df.empty:
             preview_cols = [
                 c for c in [
-                    "time",
-                    "temperature_2m",
-                    "wind_speed_10m",
-                    "cloud_cover",
-                    "precipitation",
-                    "shortwave_radiation",
-                    "european_aqi",
-                    "pm2_5",
-                    "predicted_risk_score",
+                    "time", "temperature_2m", "wind_speed_10m", "cloud_cover",
+                    "precipitation", "shortwave_radiation", "european_aqi",
+                    "pm2_5", "predicted_risk_score"
                 ]
                 if c in hourly_df.columns
             ]
@@ -1282,15 +1358,9 @@ with tab4:
     else:
         preferred_cols = [
             c for c in [
-                "outage_reference",
-                "outage_status",
-                "outage_category",
-                "affected_customers",
-                "postcode_label",
-                "estimated_restore",
-                "time_label",
-                "latitude",
-                "longitude",
+                "outage_reference", "outage_status", "outage_category",
+                "affected_customers", "postcode_label", "estimated_restore",
+                "time_label", "latitude", "longitude",
             ] if c in outages_df.columns
         ]
         st.dataframe(
@@ -1303,6 +1373,15 @@ with tab4:
 # TAB 5: RAW TWIN GRID
 # =========================================================
 with tab5:
+    csv = digital_twin_df.to_csv(index=False).encode("utf-8")
+
+    st.download_button(
+        "Download twin data",
+        csv,
+        "digital_twin.csv",
+        "text/csv"
+    )
+    
     st.subheader("Digital twin grid cells")
     st.dataframe(
         digital_twin_df.sort_values("risk_score", ascending=False),
