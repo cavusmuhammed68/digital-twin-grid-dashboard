@@ -499,7 +499,7 @@ def compute_multilayer_risk(row, outage_intensity=0.0, hour=12):
     pm25 = safe_float(row.get("pm2_5")) or 0
     aqi = safe_float(row.get("european_aqi")) or 0
 
-    env = (wind / 60) * 0.4 + (rain / 5) * 0.2 + (cloud / 100) * 0.1 + (aqi / 100) * 0.3
+    env = (wind / 40) * 0.45 + (rain / 4) * 0.25 + (cloud / 100) * 0.1 + (aqi / 80) * 0.35
     infra = float(outage_intensity or 0)
 
     ev_load = ev_load_model(hour)
@@ -511,9 +511,9 @@ def compute_multilayer_risk(row, outage_intensity=0.0, hour=12):
     total = (0.5 * env + 0.3 * infra + 0.2 * operational) * 100
     total = clamp(float(total), 0, 100)
     compound = compound_hazard_index(row)
-    total += clamp(compound * 10, 0, 15)
-
-    failure_prob = 1 / (1 + np.exp(-0.08 * (total - 50)))
+    total += clamp(compound * 6, 0, 10)
+    
+    failure_prob = 1 / (1 + np.exp(-0.045 * (total - 70)))
 
     return {
         "risk_score": round(float(total), 2),
@@ -536,14 +536,14 @@ class ScenarioEngine:
             "wind": 2.2,
             "rain": 1.6,
             "temp": -1,
-            "infra": 1.4,
+            "infra": 1.8,
         },
 
         "flood_infrastructure": {
             "wind": 1.3,
             "rain": 3.5,
             "temp": 0,
-            "infra": 1.8,
+            "infra": 2.2,
         },
 
         "heatwave_peak": {
@@ -564,7 +564,7 @@ class ScenarioEngine:
             "wind": 1.8,
             "rain": 2.8,
             "temp": +6,
-            "infra": 2.0,
+            "infra": 3.0,
         },
     }
         return scenarios.get(name, scenarios["baseline"])
@@ -613,24 +613,49 @@ class InfrastructureGraph:
         total_system_stress = np.mean(list(system_state.values()))
         return clamp(float(total_system_stress), 0, 1), system_state
 
-
 def enhanced_risk_with_cascade(row, outage_intensity, scenario_engine):
     if isinstance(row, pd.Series):
         row = row.to_dict()
 
     scenario_row = scenario_engine.apply(row)
+
+    if scenario_engine.scenario_name == "baseline":
+        outage_intensity *= 0.55
+
     base = compute_multilayer_risk(scenario_row, outage_intensity)
 
     graph = InfrastructureGraph()
     system_stress, system_breakdown = graph.propagate_failure(
         base["failure_probability"]
     )
-
+ 
     infra_multiplier = scenario_engine.params.get("infra", 1.0)
-    final_risk = clamp(base["risk_score"] * (1 + system_stress * infra_multiplier), 0, 100)
+    scenario_name = scenario_engine.scenario_name
+
+    # baseline vs hazard cascade sensitivity
+    cascade_factor = 0.9 if scenario_name == "baseline" else 1.3
+
+    # base cascade interaction
+    final_risk = base["risk_score"] * (1 + system_stress * infra_multiplier * cascade_factor)
+
+    # nonlinear disaster amplification (ONLY for hazard scenarios)
+    if scenario_name != "baseline":
+        severity = infra_multiplier
+    
+        # exponential amplification (high risk → much stronger boost)
+        scenario_boost = (final_risk / 100) ** 1.7 * severity * 30
+    
+        final_risk += scenario_boost
+
+    # soft cap (avoid flat saturation at 100)
+    final_risk = clamp(final_risk, 0, 100)
+    
+    
+    final_failure_probability = 1 / (1 + np.exp(-0.06 * (final_risk - 60)))
 
     return {
         **base,
+        "failure_probability": round(float(final_failure_probability), 3),
         "system_stress": round(float(system_stress), 3),
         "final_risk_score": round(float(final_risk), 2),
         "cascade_power": float(system_breakdown["power"]),
@@ -838,7 +863,7 @@ def build_place_dataframe(region_name: str, outages_df: pd.DataFrame, simulation
             if haversine_km(lat, lon, olat, olon) <= 25
         )
 
-        outage_intensity = clamp(nearby_outages / 5, 0, 1)
+        outage_intensity = clamp(nearby_outages / 20, 0, 1)
 
         risk = compute_multilayer_risk(row, outage_intensity)
         mc = monte_carlo_risk(row, outage_intensity, simulations=simulations)
@@ -932,7 +957,7 @@ def build_digital_twin_grid(
             solar = interpolate_weather_value(lat, lon, places_df, "shortwave_radiation")
 
             outages_near = count_outages_near(lat, lon, outages_df, radius_km=20)
-            outage_intensity = clamp(outages_near / 4, 0, 1)
+            outage_intensity = clamp(outages_near / 15, 0, 1)
 
             base_row = {
                 "wind_speed_10m": wind,
@@ -1048,7 +1073,7 @@ try:
     for _, r in places_df.iterrows():
         enhanced = enhanced_risk_with_cascade(
             r.to_dict(),
-            (safe_float(r.get("nearby_outages_25km")) or 0) / 5,
+            clamp((safe_float(r.get("nearby_outages_25km")) or 0) / 25, 0, 1),
             scenario_engine,
         )
         enhanced_rows.append(enhanced)
