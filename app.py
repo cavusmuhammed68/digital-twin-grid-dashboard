@@ -809,6 +809,14 @@ try:
     outages_df = standardise_outage_df(raw_npg_df, region_name)
 
     places_df, raw_cache = build_place_dataframe(region_name, outages_df)
+    
+    places_df["risk_label"] = places_df["risk_score"].apply(
+    lambda x: "Severe" if x >= 75 else
+              "High" if x >= 55 else
+              "Moderate" if x >= 35 else
+              "Low"
+    )
+    
     places_df["wind_speed_10m"] *= (1 + simulated_wind / 100)
     
     places_df["renewable_score"] = (
@@ -1144,29 +1152,25 @@ with tab1:
             st.metric("Highest-risk place", "N/A")
 
 # =========================================================
-# TAB 2: REGIONAL INTELLIGENCE (UPGRADED)
+# TAB 2: REGIONAL INTELLIGENCE (STABLE VERSION)
 # =========================================================
 with tab2:
     st.subheader(f"{region_name} regional intelligence")
 
     # -----------------------------------------------------
-    # KPI ROW (NEW)
+    # KPI ROW
     # -----------------------------------------------------
     k1, k2, k3, k4 = st.columns(4)
 
-    avg_risk = round(places_df["risk_score"].mean(), 1) if not places_df.empty else 0
-    max_risk = round(places_df["risk_score"].max(), 1) if not places_df.empty else 0
-    avg_aqi = round(places_df["european_aqi"].mean(), 1) if not places_df.empty else 0
-    avg_wind = round(places_df["wind_speed_10m"].mean(), 1) if not places_df.empty else 0
+    avg_risk = round(places_df.get("risk_score", pd.Series([0])).mean(), 1)
+    max_risk = round(places_df.get("risk_score", pd.Series([0])).max(), 1)
+    avg_aqi = round(places_df.get("european_aqi", pd.Series([0])).mean(), 1)
+    avg_wind = round(places_df.get("wind_speed_10m", pd.Series([0])).mean(), 1)
 
-    with k1:
-        st.metric("Avg risk", avg_risk)
-    with k2:
-        st.metric("Max risk", max_risk)
-    with k3:
-        st.metric("Avg AQI", avg_aqi)
-    with k4:
-        st.metric("Avg wind (km/h)", avg_wind)
+    k1.metric("Avg risk", avg_risk)
+    k2.metric("Max risk", max_risk)
+    k3.metric("Avg AQI", avg_aqi)
+    k4.metric("Avg wind (km/h)", avg_wind)
 
     st.markdown("---")
 
@@ -1183,12 +1187,18 @@ with tab2:
             "shortwave_radiation", "cloud_cover", "precipitation",
             "european_aqi", "pm2_5",
             "nearby_outages_25km",
-            "risk_score", "risk_label", "failure_probability",
+            "risk_score", "failure_probability",
+            "net_load", "renewable_generation"
         ]
 
+        # 🔥 CRASH-PROOF VERSION
+        df_safe = places_df.reindex(columns=display_cols)
+
+        if "risk_score" in df_safe.columns:
+            df_safe = df_safe.sort_values("risk_score", ascending=False)
+
         st.dataframe(
-            places_df[display_cols]
-            .sort_values("risk_score", ascending=False),
+            df_safe,
             use_container_width=True,
             height=320,
         )
@@ -1196,28 +1206,41 @@ with tab2:
     with right:
         st.markdown("### Top vulnerable areas")
 
-        top_places = places_df.sort_values("risk_score", ascending=False).head(5)
+        if "risk_score" in places_df.columns:
+            top_places = places_df.sort_values("risk_score", ascending=False).head(5)
+        else:
+            top_places = places_df.head(5)
 
         for _, r in top_places.iterrows():
+
+            risk_score = r.get("risk_score", 0)
+
+            risk_label = (
+                "Severe" if risk_score >= 75 else
+                "High" if risk_score >= 55 else
+                "Moderate" if risk_score >= 35 else
+                "Low"
+            )
+
             st.markdown(
                 f"""
-                **{r['place']}**
-                - Risk: **{r['risk_score']} ({r['risk_label']})**
-                - Failure probability: **{round(r['failure_probability'] * 100, 1)}%**
-                - Wind: {r['wind_speed_10m']} km/h  
-                - AQI: {r['european_aqi']}  
-                - Nearby outages: {r['nearby_outages_25km']}
+                **{r.get('place', 'Unknown')}**
+                - Risk: **{risk_score} ({risk_label})**
+                - Failure probability: **{round(r.get('failure_probability', 0) * 100, 1)}%**
+                - Wind: {r.get('wind_speed_10m', '—')} km/h  
+                - AQI: {r.get('european_aqi', '—')}  
+                - Nearby outages: {r.get('nearby_outages_25km', 0)}
                 """
             )
 
     st.markdown("---")
 
     # -----------------------------------------------------
-    # RISK TREND (NEW 🔥)
+    # RISK TREND
     # -----------------------------------------------------
     st.markdown("### Predicted risk trend (next 24h)")
 
-    if not hourly_df.empty:
+    if not hourly_df.empty and "predicted_risk_score" in hourly_df.columns:
         st.line_chart(hourly_df["predicted_risk_score"])
     else:
         st.warning("No forecast data available.")
@@ -1225,14 +1248,14 @@ with tab2:
     st.markdown("---")
 
     # -----------------------------------------------------
-    # RENEWABLE ENERGY POTENTIAL (NEW ⚡)
+    # RENEWABLE ENERGY
     # -----------------------------------------------------
     st.markdown("### Renewable energy potential")
 
     if not places_df.empty:
         places_df["renewable_score"] = (
-            places_df["shortwave_radiation"].fillna(0) * 0.6 +
-            places_df["wind_speed_10m"].fillna(0) * 0.4
+            places_df.get("shortwave_radiation", 0).fillna(0) * 0.6 +
+            places_df.get("wind_speed_10m", 0).fillna(0) * 0.4
         )
 
         st.metric(
@@ -1243,7 +1266,7 @@ with tab2:
     st.markdown("---")
 
     # -----------------------------------------------------
-    # AI INTERPRETATION (NEW 🧠)
+    # SYSTEM INTERPRETATION
     # -----------------------------------------------------
     st.markdown("### System interpretation")
 
@@ -1257,7 +1280,7 @@ with tab2:
         st.success("Grid operating under stable environmental conditions.")
 
     st.markdown("---")
-    
+
     # -----------------------------------------------------
     # AI INTERPRETATION
     # -----------------------------------------------------
@@ -1273,7 +1296,7 @@ with tab2:
     st.markdown("---")
 
     # -----------------------------------------------------
-    # SUMMARY TABLE (CLEANED)
+    # SUMMARY TABLE
     # -----------------------------------------------------
     st.markdown("### Regional digital twin summary")
 
@@ -1288,21 +1311,27 @@ with tab2:
             "Live outages",
         ],
         "Value": [
-            round(digital_twin_df["risk_score"].mean(), 2) if not digital_twin_df.empty else 0,
-            round(digital_twin_df["risk_score"].max(), 2) if not digital_twin_df.empty else 0,
-            round(digital_twin_df["failure_probability"].mean() * 100, 2) if not digital_twin_df.empty else 0,
-            round(places_df["pm2_5"].mean(), 2) if not places_df.empty else 0,
-            round(places_df["wind_speed_10m"].mean(), 2) if not places_df.empty else 0,
-            round(places_df["shortwave_radiation"].mean(), 2) if not places_df.empty else 0,
+            round(digital_twin_df.get("risk_score", pd.Series([0])).mean(), 2),
+            round(digital_twin_df.get("risk_score", pd.Series([0])).max(), 2),
+            round(digital_twin_df.get("failure_probability", pd.Series([0])).mean() * 100, 2),
+            round(places_df.get("pm2_5", pd.Series([0])).mean(), 2),
+            round(places_df.get("wind_speed_10m", pd.Series([0])).mean(), 2),
+            round(places_df.get("shortwave_radiation", pd.Series([0])).mean(), 2),
             len(outages_df),
         ],
     })
+
     st.markdown("### 🔬 Uncertainty (Monte Carlo)")
 
     for _, r in places_df.iterrows():
-        st.write(f"{r['place']} → σ={round(r['risk_std'],2)} | P95={round(r['risk_p95'],1)}")
+        st.write(
+            f"{r.get('place','Unknown')} → "
+            f"σ={round(r.get('risk_std',0),2)} | "
+            f"P95={round(r.get('risk_p95',0),1)}"
+        )
+
     st.dataframe(twin_summary, use_container_width=True, hide_index=True)
-# =========================================================
+    
 # TAB 3: SELECTED SITE FORECAST
 # =========================================================
 with tab3:
