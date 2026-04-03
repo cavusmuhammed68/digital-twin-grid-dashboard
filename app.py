@@ -965,6 +965,20 @@ def run_time_simulation(row, outage_intensity, scenario_engine, hours=24):
 
     return pd.DataFrame(timeline)
 
+def safe_tile_url(layer_mode, date_str):
+    for offset in range(0, 5):
+        test_date = datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=offset)
+        url = get_story_satellite_url(layer_mode, test_date.strftime("%Y-%m-%d"))
+
+        # hızlı test request
+        try:
+            r = requests.head(url.replace("{z}", "2").replace("{x}", "2").replace("{y}", "2"), timeout=3)
+            if r.status_code == 200:
+                return url
+        except:
+            continue
+
+    return get_story_satellite_url(layer_mode, (datetime.utcnow() - timedelta(days=3)).strftime("%Y-%m-%d"))
 
 def compute_location_risk(row: Dict, outage_intensity: float = 0.0) -> Dict:
     row = ensure_scalar_dict(row)
@@ -1420,13 +1434,14 @@ else:
 # =========================================================
 # TABS
 # =========================================================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Digital Twin Map",
     "Regional Intelligence",
     "Selected Site Forecast",
     "Live Outages",
     "Raw Twin Grid",
-    "CReDo Network"
+    "CReDo Network",
+    "Satellite Analytics" 
 ])
 
 
@@ -2368,3 +2383,389 @@ st.markdown(
     - The flood layer used in the CReDo network tab is currently a proxy depth layer. Replace it with a real raster or model output for higher-fidelity flood analytics.
     """
 )
+
+# =========================================================
+# SATELLITE STORYBOARD HELPERS
+# =========================================================
+def get_story_satellite_url(layer_mode: str, date_str: str) -> str:
+    """
+    Returns a dated GIBS tile URL for the selected storytelling mode.
+    """
+    layer_catalog = {
+        "True Colour (MODIS Terra)": (
+            "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/"
+            "MODIS_Terra_CorrectedReflectance_TrueColor/default/"
+            f"{date_str}/GoogleMapsCompatible_Level9/{{z}}/{{y}}/{{x}}.jpg"
+        ),
+        "True Colour (VIIRS NOAA-20)": (
+            "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/"
+            "VIIRS_NOAA20_CorrectedReflectance_TrueColor/default/"
+            f"{date_str}/GoogleMapsCompatible_Level9/{{z}}/{{y}}/{{x}}.jpg"
+        ),
+        "Night Lights (NOAA-20 DNB Radiance)": (
+            "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/"
+            "VIIRS_NOAA20_DayNightBand_At_Sensor_Radiance/default/"
+            f"{date_str}/GoogleMapsCompatible_Level8/{{z}}/{{y}}/{{x}}.png"
+        ),
+        # legacy fallback if needed
+        "Night Lights (Legacy Black Marble)": (
+            "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/"
+            "BlackMarble_2016/default/"
+            f"{date_str}/GoogleMapsCompatible_Level8/{{z}}/{{y}}/{{x}}.png"
+        ),
+    }
+    return layer_catalog[layer_mode]
+
+from datetime import datetime, timedelta
+
+def get_story_phase_dates():
+    today = datetime.utcnow().date()
+
+    return {
+        "pre": (today - timedelta(days=5)).strftime("%Y-%m-%d"),
+        "during": (today - timedelta(days=4)).strftime("%Y-%m-%d"),
+        "peak": (today - timedelta(days=3)).strftime("%Y-%m-%d"),
+        "recovery": (today - timedelta(days=2)).strftime("%Y-%m-%d"),
+    }
+
+def create_satellite_story_map(
+    region_name: str,
+    phase_title: str,
+    layer_mode: str,
+    date_str: str,
+    places_df: pd.DataFrame,
+    outages_df: pd.DataFrame,
+    scenario_choice: str,
+    show_places: bool = True,
+    show_outages: bool = True,
+    show_risk_overlay: bool = True,
+):
+    center = REGIONS[region_name]["center"]
+    bbox = REGIONS[region_name]["bbox"]  # [min_lon, min_lat, max_lon, max_lat]
+    
+    m = folium.Map(
+        location=[center["lat"], center["lon"]],
+        zoom_start=max(int(center["zoom"]), 6),
+        tiles="CartoDB dark_matter",
+        control_scale=True,
+        prefer_canvas=True,
+    )
+
+    m.fit_bounds([
+        [bbox[1], bbox[0]],
+        [bbox[3], bbox[2]]
+    ])
+    
+
+    # Fit tightly to the selected region so Newcastle/Yorkshire is actually visible
+    m.fit_bounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]])
+
+    # base satellite layer
+    tile_url = safe_tile_url(layer_mode, date_str)
+    folium.raster_layers.TileLayer(
+        tiles=tile_url,
+        attr="NASA GIBS",
+        name=f"{layer_mode} | {date_str}",
+        overlay=True,
+        control=False,
+        opacity=0.92,
+    ).add_to(m)
+
+    # optional region boundary
+    region_polygon_latlon = [[lat, lon] for lon, lat in REGIONS[region_name]["polygon"]]
+    folium.Polygon(
+        locations=region_polygon_latlon,
+        color="#ffb000",
+        weight=2,
+        fill=True,
+        fill_opacity=0.03,
+        popup=f"{region_name} boundary",
+    ).add_to(m)
+
+    # risk / flood proxy overlay by scenario phase
+    if show_risk_overlay and not places_df.empty:
+        for _, r in places_df.iterrows():
+            lat = safe_float(r.get("lat"))
+            lon = safe_float(r.get("lon"))
+            if lat is None or lon is None:
+                continue
+
+            flood_depth = infer_flood_depth_for_place(r.to_dict(), scenario_choice)
+            risk_score = safe_float(r.get("risk_score")) or 0
+
+            # make phases visually different
+            phase_multiplier = {
+                "Pre-event": 0.45,
+                "Disturbance": 0.85,
+                "Peak failure": 1.20,
+                "Recovery": 0.60,
+            }.get(phase_title, 0.80)
+
+            adj_depth = flood_depth * phase_multiplier
+            adj_risk = risk_score * phase_multiplier
+
+            if adj_depth > 0.05 or adj_risk > 35:
+                folium.Circle(
+                    location=[lat, lon],
+                    radius=3000 + adj_depth * 9000 + adj_risk * 18,
+                    color="#53b7ff",
+                    weight=1,
+                    fill=True,
+                    fill_color="#53b7ff",
+                    fill_opacity=min(0.05 + adj_depth * 0.08, 0.28),
+                    popup=folium.Popup(
+                        f"""
+                        <b>{r.get('place')}</b><br>
+                        Phase: {phase_title}<br>
+                        Date: {date_str}<br>
+                        Flood-depth proxy: {adj_depth:.2f} m<br>
+                        Risk score proxy: {adj_risk:.1f}
+                        """,
+                        max_width=300,
+                    ),
+                ).add_to(m)
+
+    if show_places and not places_df.empty:
+        for _, r in places_df.iterrows():
+            lat = safe_float(r.get("lat"))
+            lon = safe_float(r.get("lon"))
+            if lat is None or lon is None:
+                continue
+
+            risk = safe_float(r.get("risk_score")) or 0
+            if phase_title == "Pre-event":
+                risk *= 0.55
+            elif phase_title == "Disturbance":
+                risk *= 0.85
+            elif phase_title == "Peak failure":
+                risk *= 1.10
+            elif phase_title == "Recovery":
+                risk *= 0.70
+
+            if risk >= 75:
+                colour = "darkred"
+            elif risk >= 55:
+                colour = "red"
+            elif risk >= 35:
+                colour = "orange"
+            else:
+                colour = "green"
+
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=8,
+                color="white",
+                weight=1.5,
+                fill=True,
+                fill_color=colour,
+                fill_opacity=0.95,
+                tooltip=f"{r.get('place')} | {phase_title}",
+                popup=folium.Popup(
+                    f"""
+                    <b>{r.get('place')}</b><br>
+                    Phase: {phase_title}<br>
+                    Date: {date_str}<br>
+                    Wind: {safe_float(r.get('wind_speed_10m')) or 0:.1f} km/h<br>
+                    Rain: {safe_float(r.get('precipitation')) or 0:.1f} mm<br>
+                    AQI: {safe_float(r.get('european_aqi')) or 0:.1f}<br>
+                    Risk score: {risk:.1f}<br>
+                    Nearby outages: {safe_float(r.get('nearby_outages_25km')) or 0:.0f}
+                    """,
+                    max_width=320,
+                ),
+            ).add_to(m)
+
+    if show_outages and not outages_df.empty and phase_title in ["Disturbance", "Peak failure", "Recovery"]:
+        for _, r in outages_df.iterrows():
+            lat = safe_float(r.get("latitude"))
+            lon = safe_float(r.get("longitude"))
+            if lat is None or lon is None:
+                continue
+
+            folium.Marker(
+                location=[lat, lon],
+                tooltip=f"Outage | {r.get('outage_status', 'Unknown')}",
+                popup=folium.Popup(
+                    f"""
+                    <b>Power outage</b><br>
+                    Phase: {phase_title}<br>
+                    Date: {date_str}<br>
+                    Reference: {r.get('outage_reference', 'N/A')}<br>
+                    Status: {r.get('outage_status', 'Unknown')}<br>
+                    Category: {r.get('outage_category', 'Unknown')}<br>
+                    Customers affected: {r.get('affected_customers', '')}<br>
+                    Estimated restore: {r.get('estimated_restore', '')}
+                    """,
+                    max_width=340,
+                ),
+                icon=folium.Icon(color="red", icon="flash"),
+            ).add_to(m)
+
+    legend_html = f"""
+    <div style="
+        position: fixed;
+        bottom: 18px;
+        left: 18px;
+        z-index: 9999;
+        background-color: rgba(8,12,20,0.88);
+        color: white;
+        padding: 10px 12px;
+        border-radius: 8px;
+        font-size: 12px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+    ">
+        <b>{phase_title}</b><br>
+        Date: {date_str}<br>
+        Layer: {layer_mode}
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+    return m
+# =========================================================
+# TAB 7 - SATELLITE ANALYTICS (IMPROVED)
+# =========================================================
+with tab7:
+    st.subheader("🛰️ Advanced Satellite Storyboard for Newcastle & Yorkshire")
+
+    st.markdown(
+        "This panel is designed to look more like a paper figure: pre-event, disturbance, peak failure, and recovery."
+    )
+
+    story_left, story_right = st.columns([1.15, 1])
+
+    with story_left:
+        layer_mode = st.selectbox(
+            "Satellite visualisation mode",
+            [
+                "True Colour (VIIRS NOAA-20)",
+                "True Colour (MODIS Terra)",
+                "Night Lights (NOAA-20 DNB Radiance)",
+                "Night Lights (Legacy Black Marble)",
+            ],
+            index=0,
+            key="sat_story_layer_mode"
+        )
+
+        use_fixed_story_dates = st.checkbox(
+            "Use recommended event-style dates",
+            value=True,
+            key="sat_story_fixed_dates"
+        )
+
+        show_places = st.checkbox("Show place markers", value=True, key="sat_story_places")
+        show_outages = st.checkbox("Show outage markers", value=True, key="sat_story_outages")
+        show_risk_overlay = st.checkbox("Show hazard/risk overlay", value=True, key="sat_story_risk")
+
+    with story_right:
+        st.markdown("### Notes")
+        st.caption(
+            "For a cleaner UK-focused result, this figure now fits the selected regional bounds instead of opening at a generic global view."
+        )
+        st.caption(
+            "For event-style storytelling, true-colour layers usually look better for clouds/flood context; night-lights layers are better for blackout/recovery narratives."
+        )
+
+    fixed_dates = get_story_phase_dates()
+
+    if use_fixed_story_dates:
+        pre_date = datetime.strptime(fixed_dates["pre"], "%Y-%m-%d").date()
+        during_date = datetime.strptime(fixed_dates["during"], "%Y-%m-%d").date()
+        peak_date = datetime.strptime(fixed_dates["peak"], "%Y-%m-%d").date()
+        recovery_date = datetime.strptime(fixed_dates["recovery"], "%Y-%m-%d").date()
+        st.info(
+            f"Using storyboard dates: pre={pre_date}, disturbance={during_date}, peak={peak_date}, recovery={recovery_date}"
+        )
+    else:
+        dcol1, dcol2, dcol3, dcol4 = st.columns(4)
+        pre_date = dcol1.date_input("Pre-event date", datetime.utcnow(), key="sat_pre_date")
+        during_date = dcol2.date_input("Disturbance date", datetime.utcnow(), key="sat_during_date")
+        peak_date = dcol3.date_input("Peak failure date", datetime.utcnow(), key="sat_peak_date")
+        recovery_date = dcol4.date_input("Recovery date", datetime.utcnow(), key="sat_recovery_date")
+
+    st.markdown("### Figure-style 2 × 2 satellite panel")
+
+    top_left, top_right = st.columns(2)
+    bottom_left, bottom_right = st.columns(2)
+
+    with top_left:
+        st.markdown("#### (a) Pre-event")
+        pre_map = create_satellite_story_map(
+            region_name=region_name,
+            phase_title="Pre-event",
+            layer_mode=layer_mode,
+            date_str=pre_date.strftime("%Y-%m-%d"),
+            places_df=places_df,
+            outages_df=outages_df,
+            scenario_choice=scenario_choice,
+            show_places=show_places,
+            show_outages=False,
+            show_risk_overlay=show_risk_overlay,
+        )
+        components.html(pre_map._repr_html_(), height=360)
+
+    with top_right:
+        st.markdown("#### (b) Disturbance")
+        during_map = create_satellite_story_map(
+            region_name=region_name,
+            phase_title="Disturbance",
+            layer_mode=layer_mode,
+            date_str=during_date.strftime("%Y-%m-%d"),
+            places_df=places_df,
+            outages_df=outages_df,
+            scenario_choice=scenario_choice,
+            show_places=show_places,
+            show_outages=show_outages,
+            show_risk_overlay=show_risk_overlay,
+        )
+        components.html(during_map._repr_html_(), height=360)
+
+    with bottom_left:
+        st.markdown("#### (c) Peak failure")
+        peak_map = create_satellite_story_map(
+            region_name=region_name,
+            phase_title="Peak failure",
+            layer_mode=layer_mode,
+            date_str=peak_date.strftime("%Y-%m-%d"),
+            places_df=places_df,
+            outages_df=outages_df,
+            scenario_choice=scenario_choice,
+            show_places=show_places,
+            show_outages=show_outages,
+            show_risk_overlay=show_risk_overlay,
+        )
+        components.html(peak_map._repr_html_(), height=360)
+
+    with bottom_right:
+        st.markdown("#### (d) Recovery")
+        recovery_map = create_satellite_story_map(
+            region_name=region_name,
+            phase_title="Recovery",
+            layer_mode=layer_mode,
+            date_str=recovery_date.strftime("%Y-%m-%d"),
+            places_df=places_df,
+            outages_df=outages_df,
+            scenario_choice=scenario_choice,
+            show_places=show_places,
+            show_outages=show_outages,
+            show_risk_overlay=show_risk_overlay,
+        )
+        components.html(recovery_map._repr_html_(), height=360)
+
+    st.markdown("---")
+    st.markdown("### Figure caption")
+    st.markdown(
+        f"""
+        **Spatiotemporal evolution over {region_name}** showing  
+        (a) pre-event baseline,  
+        (b) disturbance phase,  
+        (c) peak failure conditions, and  
+        (d) recovery phase,  
+        rendered using **{layer_mode}** with region-focused overlays for outages and risk.
+        """
+    )
+
+    st.markdown("### Interpretation")
+    st.write(
+        "If you want a paper-style blackout narrative, use **Night Lights (NOAA-20 DNB Radiance)**. "
+        "If you want flood/cloud/context interpretation, use **True Colour (VIIRS NOAA-20)**."
+    )
