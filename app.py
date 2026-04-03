@@ -1,8 +1,9 @@
 import json
 import math
+import random
+import time
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
-import random
 
 import numpy as np
 import pandas as pd
@@ -12,12 +13,24 @@ import streamlit.components.v1 as components
 import urllib3
 import folium
 from folium.plugins import HeatMap
+import plotly.graph_objects as go
+import networkx as nx
+from streamlit_plotly_events import plotly_events
 
+# =========================================================
+# PAGE + SESSION
+# =========================================================
 st.set_page_config(
     page_title="North East & Yorkshire Grid Digital Twin",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+if "credo_selected_node" not in st.session_state:
+    st.session_state["credo_selected_node"] = None
+
+if "credo_last_step" not in st.session_state:
+    st.session_state["credo_last_step"] = 0
 
 st.markdown(
     """
@@ -46,6 +59,11 @@ body {
     background-color: rgba(255,255,255,0.1);
     border-radius: 10px;
 }
+
+.small-note {
+    font-size: 0.85rem;
+    opacity: 0.85;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -56,7 +74,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 session = requests.Session()
 session.verify = False
 session.headers.update({
-    "User-Agent": "north-east-yorkshire-digital-twin/3.0"
+    "User-Agent": "north-east-yorkshire-digital-twin/4.0"
 })
 
 components.html(
@@ -70,6 +88,9 @@ components.html(
     height=0,
 )
 
+# =========================================================
+# CONSTANTS
+# =========================================================
 NPG_DATASET_URL = (
     "https://northernpowergrid.opendatasoft.com/api/explore/v2.1/"
     "catalog/datasets/live-power-cuts-data/records"
@@ -194,7 +215,9 @@ REGIONS = {
     },
 }
 
-
+# =========================================================
+# BASIC HELPERS
+# =========================================================
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -236,7 +259,12 @@ def force_scalar(x):
 def ensure_scalar_dict(row):
     if isinstance(row, pd.Series):
         row = row.to_dict()
-    return {k: force_scalar(v) if isinstance(v, (pd.Series, list, tuple, np.ndarray, int, float, np.integer, np.floating, str, type(None))) else v for k, v in row.items()}
+    return {
+        k: force_scalar(v)
+        if isinstance(v, (pd.Series, list, tuple, np.ndarray, int, float, np.integer, np.floating, str, type(None)))
+        else v
+        for k, v in row.items()
+    }
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -255,6 +283,25 @@ def haversine_km(lat1, lon1, lat2, lon2):
 def point_in_bbox(lat: float, lon: float, bbox: List[float]) -> bool:
     min_lon, min_lat, max_lon, max_lat = bbox
     return min_lat <= lat <= max_lat and min_lon <= lon <= max_lon
+
+
+def normalise_to_unit(x: float, low: float, high: float) -> float:
+    if high <= low:
+        return 0.0
+    return clamp((x - low) / (high - low), 0.0, 1.0)
+
+
+def get_risk_label(x):
+    x = safe_float(x)
+    if x is None:
+        return "Unknown"
+    if x >= 75:
+        return "Severe"
+    elif x >= 55:
+        return "High"
+    elif x >= 35:
+        return "Moderate"
+    return "Low"
 
 
 def get_satellite_tile_url(satellite_name: str) -> str:
@@ -279,6 +326,250 @@ def solar_interpretation(current: Dict) -> Tuple[str, str]:
     return f"{solar} W/m²", f"Daytime solar conditions. Cloud cover is {cloud}%."
 
 
+def get_place_from_node(node_name: str) -> str:
+    for suffix in ["_power", "_water", "_telecom"]:
+        if node_name.endswith(suffix):
+            return node_name.replace(suffix, "")
+    return node_name
+
+
+def node_icon(node_type: str) -> str:
+    return {
+        "power": "⚡",
+        "water": "💧",
+        "telecom": "📡",
+        "city": "🏙️",
+    }.get(node_type, "•")
+
+
+def node_marker_symbol(node_type: str) -> str:
+    return {
+        "power": "square",
+        "water": "circle",
+        "telecom": "diamond",
+        "city": "triangle-up",
+    }.get(node_type, "circle")
+
+
+def node_display_colour(node_type: str, state: int) -> str:
+    if state == 2:
+        return "#ff3b30"
+    if state == 1:
+        return "#ffcc00"
+    return {
+        "power": "#ffd60a",
+        "water": "#4ea5ff",
+        "telecom": "#b57cff",
+        "city": "#34c759",
+    }.get(node_type, "#cccccc")
+
+
+# =========================================================
+# NETWORK / CREDO HELPERS
+# =========================================================
+def build_credo_layout(place_names: List[str]) -> Dict[str, Tuple[float, float]]:
+    pos = {}
+    n = max(len(place_names), 1)
+    x_positions = np.linspace(-1.0, 1.0, n)
+
+    y_levels = {
+        "city": 0.95,
+        "power": 0.30,
+        "telecom": -0.05,
+        "water": -0.40,
+    }
+
+    for i, place in enumerate(place_names):
+        x = float(x_positions[i])
+        pos[place] = (x, y_levels["city"])
+        pos[f"{place}_power"] = (x - 0.08, y_levels["power"])
+        pos[f"{place}_telecom"] = (x + 0.08, y_levels["telecom"])
+        pos[f"{place}_water"] = (x, y_levels["water"])
+
+    return pos
+
+
+def infer_flood_depth_for_place(row: Dict, scenario_name: str = "baseline") -> float:
+    rain = safe_float(row.get("precipitation")) or 0.0
+    outages = safe_float(row.get("nearby_outages_25km")) or 0.0
+    risk = safe_float(row.get("risk_score")) or 0.0
+    cloud = safe_float(row.get("cloud_cover")) or 0.0
+
+    scenario_multiplier = {
+        "baseline": 1.00,
+        "storm_cascade": 1.25,
+        "flood_infrastructure": 1.80,
+        "heatwave_peak": 0.30,
+        "pollution_event": 0.20,
+        "compound_extreme": 2.00,
+    }.get(scenario_name, 1.00)
+
+    depth = (
+        0.035 * rain +
+        0.018 * outages +
+        0.002 * risk +
+        0.001 * cloud
+    ) * scenario_multiplier
+
+    return round(clamp(depth, 0.0, 2.5), 3)
+
+
+def direct_failure_probability(asset_type: str, row: Dict, flood_depth: float, t: int) -> float:
+    wind = safe_float(row.get("wind_speed_10m")) or 0.0
+    rain = safe_float(row.get("precipitation")) or 0.0
+    outages = safe_float(row.get("nearby_outages_25km")) or 0.0
+    aqi = safe_float(row.get("european_aqi")) or 0.0
+
+    base = {
+        "power": 0.10,
+        "water": 0.12,
+        "telecom": 0.08,
+        "city": 0.02,
+    }.get(asset_type, 0.05)
+
+    prob = base
+    prob += clamp(flood_depth / 1.2, 0, 1) * 0.45
+    prob += clamp(wind / 35, 0, 1) * 0.15
+    prob += clamp(rain / 8, 0, 1) * 0.15
+    prob += clamp(outages / 8, 0, 1) * 0.12
+    prob += clamp(aqi / 100, 0, 1) * 0.05
+    prob += min(t * 0.015, 0.18)
+
+    return clamp(prob, 0.0, 0.95)
+
+
+def recovery_probability(asset_type: str, flood_depth: float, t: int) -> float:
+    base = {
+        "power": 0.05,
+        "water": 0.04,
+        "telecom": 0.05,
+        "city": 0.03,
+    }.get(asset_type, 0.04)
+
+    prob = base + min(t * 0.01, 0.15) - clamp(flood_depth / 1.5, 0, 1) * 0.12
+    return clamp(prob, 0.0, 0.30)
+
+
+def build_synced_credo_map(
+    region_name: str,
+    selected_place_name: Optional[str],
+    places_df: pd.DataFrame,
+    outages_df: pd.DataFrame,
+    scenario_choice: str,
+):
+    center = REGIONS[region_name]["center"]
+
+    if selected_place_name and "place" in places_df.columns:
+        hit = places_df[places_df["place"] == selected_place_name]
+        if not hit.empty:
+            center = {
+                "lat": safe_float(hit.iloc[0].get("lat")) or center["lat"],
+                "lon": safe_float(hit.iloc[0].get("lon")) or center["lon"],
+                "zoom": 10
+            }
+
+    m = folium.Map(
+        location=[center["lat"], center["lon"]],
+        zoom_start=max(int(center["zoom"]), 6),
+        tiles="CartoDB positron",
+        control_scale=True,
+    )
+
+    region_polygon_latlon = [[lat, lon] for lon, lat in REGIONS[region_name]["polygon"]]
+    folium.Polygon(
+        locations=region_polygon_latlon,
+        color="#ff8800",
+        weight=2,
+        fill=True,
+        fill_opacity=0.04,
+    ).add_to(m)
+
+    flood_layer = folium.FeatureGroup(name="Flood overlay", show=True)
+    node_layer = folium.FeatureGroup(name="Assets", show=True)
+    outage_layer = folium.FeatureGroup(name="Outages", show=True)
+
+    for _, r in places_df.iterrows():
+        place = r.get("place")
+        lat = safe_float(r.get("lat"))
+        lon = safe_float(r.get("lon"))
+        if lat is None or lon is None:
+            continue
+
+        flood_depth = infer_flood_depth_for_place(r.to_dict(), scenario_choice)
+        radius = 8000 + flood_depth * 7000
+
+        if flood_depth > 0.05:
+            folium.Circle(
+                location=[lat, lon],
+                radius=radius,
+                color="#4ea5ff",
+                weight=1,
+                fill=True,
+                fill_color="#4ea5ff",
+                fill_opacity=min(0.08 + flood_depth * 0.08, 0.35),
+                popup=f"{place} flood depth proxy: {flood_depth} m",
+            ).add_to(flood_layer)
+
+        highlight = place == selected_place_name
+        marker_colour = "darkred" if highlight else "green"
+        marker_radius = 11 if highlight else 8
+
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=marker_radius,
+            color="white",
+            weight=2,
+            fill=True,
+            fill_color=marker_colour,
+            fill_opacity=0.95,
+            tooltip=f"{place}",
+            popup=folium.Popup(
+                f"""
+                <b>{place}</b><br>
+                Wind: {safe_float(r.get('wind_speed_10m')) or 0:.1f} km/h<br>
+                Rain: {safe_float(r.get('precipitation')) or 0:.1f} mm<br>
+                AQI: {safe_float(r.get('european_aqi')) or 0:.1f}<br>
+                Nearby outages: {safe_float(r.get('nearby_outages_25km')) or 0:.0f}<br>
+                Flood depth proxy: {flood_depth:.2f} m
+                """,
+                max_width=300,
+            ),
+        ).add_to(node_layer)
+
+    if not outages_df.empty:
+        for _, r in outages_df.iterrows():
+            lat = safe_float(r.get("latitude"))
+            lon = safe_float(r.get("longitude"))
+            if lat is None or lon is None:
+                continue
+
+            folium.Marker(
+                location=[lat, lon],
+                tooltip=f"Outage | {r.get('outage_status', 'Unknown')}",
+                popup=folium.Popup(
+                    f"""
+                    <b>Power outage</b><br>
+                    Reference: {r.get('outage_reference', 'N/A')}<br>
+                    Status: {r.get('outage_status', 'Unknown')}<br>
+                    Category: {r.get('outage_category', 'Unknown')}<br>
+                    Customers affected: {r.get('affected_customers', '')}<br>
+                    Estimated restore: {r.get('estimated_restore', '')}
+                    """,
+                    max_width=320,
+                ),
+                icon=folium.Icon(color="red", icon="flash"),
+            ).add_to(outage_layer)
+
+    flood_layer.add_to(m)
+    node_layer.add_to(m)
+    outage_layer.add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+    return m
+
+
+# =========================================================
+# API FETCH
+# =========================================================
 @st.cache_data(ttl=25, show_spinner=False)
 def fetch_weather(lat: float, lon: float) -> Dict:
     params = {
@@ -327,6 +618,9 @@ def fetch_npg_live_power_cuts(limit: int = 100) -> Dict:
         return {"results": []}
 
 
+# =========================================================
+# OUTAGE NORMALISATION
+# =========================================================
 def payload_to_df(payload: Dict) -> pd.DataFrame:
     results = payload.get("results", [])
     if not results:
@@ -461,6 +755,9 @@ def standardise_outage_df(df: pd.DataFrame, region_name: str) -> pd.DataFrame:
     return df
 
 
+# =========================================================
+# MODELS
+# =========================================================
 def renewable_generation_model(row):
     if isinstance(row, pd.Series):
         row = row.to_dict()
@@ -487,6 +784,13 @@ def ev_load_model(hour: int, base_load=1.0):
     return base_load
 
 
+def compound_hazard_index(row):
+    wind = safe_float(row.get("wind_speed_10m")) or 0
+    rain = safe_float(row.get("precipitation")) or 0
+    temp = safe_float(row.get("temperature_2m")) or 0
+    return (wind * rain) / 50 + abs(temp - 18) / 10
+
+
 def compute_multilayer_risk(row, outage_intensity=0.0, hour=12):
     if isinstance(row, pd.Series):
         row = row.to_dict()
@@ -507,12 +811,12 @@ def compute_multilayer_risk(row, outage_intensity=0.0, hour=12):
     net_load = ev_load * 100 - renewable
 
     operational = clamp(net_load / 200, 0, 1)
-    
+
     total = (0.5 * env + 0.3 * infra + 0.2 * operational) * 100
     total = clamp(float(total), 0, 100)
     compound = compound_hazard_index(row)
     total += clamp(compound * 6, 0, 10)
-    
+
     failure_prob = 1 / (1 + np.exp(-0.045 * (total - 70)))
 
     return {
@@ -530,54 +834,26 @@ class ScenarioEngine:
 
     def _load_scenario(self, name):
         scenarios = {
-        "baseline": {"wind": 1.0, "rain": 1.0, "temp": 0, "infra": 1.0},
-
-        "storm_cascade": {
-            "wind": 2.2,
-            "rain": 1.6,
-            "temp": -1,
-            "infra": 1.8,
-        },
-
-        "flood_infrastructure": {
-            "wind": 1.3,
-            "rain": 3.5,
-            "temp": 0,
-            "infra": 2.2,
-        },
-
-        "heatwave_peak": {
-            "wind": 0.6,
-            "rain": 0.2,
-            "temp": +10,
-            "infra": 1.5,
-        },
-
-        "pollution_event": {
-            "wind": 0.4,
-            "rain": 0.1,
-            "temp": +5,
-            "infra": 1.2,
-        },
-
-        "compound_extreme": {
-            "wind": 1.8,
-            "rain": 2.8,
-            "temp": +6,
-            "infra": 3.0,
-        },
-    }
+            "baseline": {"wind": 1.0, "rain": 1.0, "temp": 0, "infra": 1.0},
+            "storm_cascade": {"wind": 2.2, "rain": 1.6, "temp": -1, "infra": 1.8},
+            "flood_infrastructure": {"wind": 1.3, "rain": 3.5, "temp": 0, "infra": 2.2},
+            "heatwave_peak": {"wind": 0.6, "rain": 0.2, "temp": +10, "infra": 1.5},
+            "pollution_event": {"wind": 0.4, "rain": 0.1, "temp": +5, "infra": 1.2},
+            "compound_extreme": {"wind": 1.8, "rain": 2.8, "temp": +6, "infra": 3.0},
+        }
         return scenarios.get(name, scenarios["baseline"])
 
     def apply(self, row):
         if isinstance(row, pd.Series):
             row = row.to_dict()
         row = dict(row)
+
         row["wind_speed_10m"] = (safe_float(row.get("wind_speed_10m")) or 0) * self.params["wind"]
         row["precipitation"] = (safe_float(row.get("precipitation")) or 0) * self.params["rain"]
         row["temperature_2m"] = (safe_float(row.get("temperature_2m")) or 0) + self.params["temp"]
-        row["shortwave_radiation"] *= (1 - 0.3 * self.params["rain"])
-        row["european_aqi"] *= (1 + 0.4 * self.params["infra"])
+
+        row["shortwave_radiation"] = (safe_float(row.get("shortwave_radiation")) or 0) * max(0, (1 - 0.3 * self.params["rain"]))
+        row["european_aqi"] = (safe_float(row.get("european_aqi")) or 0) * (1 + 0.4 * self.params["infra"])
         return row
 
 
@@ -598,22 +874,17 @@ class InfrastructureGraph:
             if infra == "power":
                 continue
 
-            dependency_failures = [
-                system_state.get(dep, 0) for dep in config["depends_on"]
-            ]
+            dependency_failures = [system_state.get(dep, 0) for dep in config["depends_on"]]
 
             if dependency_failures:
                 combined = np.mean(dependency_failures)
-                system_state[infra] = clamp(
-                    (combined ** 1.5) * config["impact_factor"],
-                    0,
-                    1
-                )
+                system_state[infra] = clamp((combined ** 1.5) * config["impact_factor"], 0, 1)
             else:
                 system_state[infra] = 0
 
         total_system_stress = np.mean(list(system_state.values()))
         return clamp(float(total_system_stress), 0, 1), system_state
+
 
 def enhanced_risk_with_cascade(row, outage_intensity, scenario_engine):
     if isinstance(row, pd.Series):
@@ -627,32 +898,20 @@ def enhanced_risk_with_cascade(row, outage_intensity, scenario_engine):
     base = compute_multilayer_risk(scenario_row, outage_intensity)
 
     graph = InfrastructureGraph()
-    system_stress, system_breakdown = graph.propagate_failure(
-        base["failure_probability"]
-    )
- 
+    system_stress, system_breakdown = graph.propagate_failure(base["failure_probability"])
+
     infra_multiplier = scenario_engine.params.get("infra", 1.0)
     scenario_name = scenario_engine.scenario_name
-
-    # baseline vs hazard cascade sensitivity
     cascade_factor = 0.9 if scenario_name == "baseline" else 1.3
 
-    # base cascade interaction
     final_risk = base["risk_score"] * (1 + system_stress * infra_multiplier * cascade_factor)
 
-    # nonlinear disaster amplification (ONLY for hazard scenarios)
     if scenario_name != "baseline":
         severity = infra_multiplier
-    
-        # exponential amplification (high risk → much stronger boost)
         scenario_boost = (final_risk / 100) ** 1.7 * severity * 30
-    
         final_risk += scenario_boost
 
-    # soft cap (avoid flat saturation at 100)
     final_risk = clamp(final_risk, 0, 100)
-    
-    
     final_failure_probability = 1 / (1 + np.exp(-0.06 * (final_risk - 60)))
 
     return {
@@ -666,28 +925,6 @@ def enhanced_risk_with_cascade(row, outage_intensity, scenario_engine):
         "cascade_transport": float(system_breakdown["transport"]),
     }
 
-def run_time_simulation(row, outage_intensity, scenario_engine, hours=24):
-    timeline = []
-
-    for h in range(hours):
-        modified = dict(row)
-
-        modified["wind_speed_10m"] *= random.uniform(0.9, 1.2)
-        modified["precipitation"] *= random.uniform(0.8, 1.3)
-
-        risk = enhanced_risk_with_cascade(
-            modified,
-            outage_intensity * (1 + h / 24),
-            scenario_engine
-        )
-
-        timeline.append({
-            "hour": h,
-            "risk": risk["final_risk_score"],
-            "failure_prob": risk["failure_probability"],
-        })
-
-    return pd.DataFrame(timeline)
 
 def monte_carlo_risk(row, outage_intensity, simulations=30):
     scores = []
@@ -710,54 +947,24 @@ def monte_carlo_risk(row, outage_intensity, simulations=30):
     }
 
 
-def combine_weather_air(place_name: str, lat: float, lon: float) -> Dict:
-    weather = fetch_weather(lat, lon)
-    air = fetch_air_quality(lat, lon)
+def run_time_simulation(row, outage_intensity, scenario_engine, hours=24):
+    timeline = []
 
-    current_w = weather.get("current", {})
-    current_a = air.get("current", {})
+    for h in range(hours):
+        modified = dict(row)
+        modified["wind_speed_10m"] = (safe_float(modified.get("wind_speed_10m")) or 0) * random.uniform(0.9, 1.2)
+        modified["precipitation"] = (safe_float(modified.get("precipitation")) or 0) * random.uniform(0.8, 1.3)
 
-    row = {
-        "place": place_name,
-        "lat": lat,
-        "lon": lon,
-        "time": current_w.get("time"),
-        "temperature_2m": current_w.get("temperature_2m"),
-        "apparent_temperature": current_w.get("apparent_temperature"),
-        "wind_speed_10m": current_w.get("wind_speed_10m"),
-        "wind_direction_10m": current_w.get("wind_direction_10m"),
-        "surface_pressure": current_w.get("surface_pressure"),
-        "cloud_cover": current_w.get("cloud_cover"),
-        "shortwave_radiation": current_w.get("shortwave_radiation"),
-        "direct_radiation": current_w.get("direct_radiation"),
-        "diffuse_radiation": current_w.get("diffuse_radiation"),
-        "relative_humidity_2m": current_w.get("relative_humidity_2m"),
-        "precipitation": current_w.get("precipitation"),
-        "is_day": current_w.get("is_day"),
-        "european_aqi": current_a.get("european_aqi"),
-        "pm2_5": current_a.get("pm2_5"),
-        "pm10": current_a.get("pm10"),
-        "nitrogen_dioxide": current_a.get("nitrogen_dioxide"),
-        "ozone": current_a.get("ozone"),
-        "sulphur_dioxide": current_a.get("sulphur_dioxide"),
-        "carbon_monoxide": current_a.get("carbon_monoxide"),
-        "aerosol_optical_depth": current_a.get("aerosol_optical_depth"),
-        "dust": current_a.get("dust"),
-        "uv_index": current_a.get("uv_index"),
-    }
+        risk = enhanced_risk_with_cascade(modified, outage_intensity * (1 + h / 24), scenario_engine)
 
-    return {
-        "weather_raw": weather,
-        "air_raw": air,
-        "current_row": row,
-    }
+        timeline.append({
+            "hour": h,
+            "risk": risk["final_risk_score"],
+            "failure_prob": risk["failure_probability"],
+        })
 
-def compound_hazard_index(row):
-    wind = safe_float(row.get("wind_speed_10m")) or 0
-    rain = safe_float(row.get("precipitation")) or 0
-    temp = safe_float(row.get("temperature_2m")) or 0
+    return pd.DataFrame(timeline)
 
-    return (wind * rain) / 50 + abs(temp - 18) / 10
 
 def compute_location_risk(row: Dict, outage_intensity: float = 0.0) -> Dict:
     row = ensure_scalar_dict(row)
@@ -804,6 +1011,52 @@ def compute_location_risk(row: Dict, outage_intensity: float = 0.0) -> Dict:
         "risk_label": label,
         "risk_colour": colour,
         "failure_probability": round(float(failure_probability), 3),
+    }
+
+
+# =========================================================
+# DATA COMBINATION
+# =========================================================
+def combine_weather_air(place_name: str, lat: float, lon: float) -> Dict:
+    weather = fetch_weather(lat, lon)
+    air = fetch_air_quality(lat, lon)
+
+    current_w = weather.get("current", {})
+    current_a = air.get("current", {})
+
+    row = {
+        "place": place_name,
+        "lat": lat,
+        "lon": lon,
+        "time": current_w.get("time"),
+        "temperature_2m": current_w.get("temperature_2m"),
+        "apparent_temperature": current_w.get("apparent_temperature"),
+        "wind_speed_10m": current_w.get("wind_speed_10m"),
+        "wind_direction_10m": current_w.get("wind_direction_10m"),
+        "surface_pressure": current_w.get("surface_pressure"),
+        "cloud_cover": current_w.get("cloud_cover"),
+        "shortwave_radiation": current_w.get("shortwave_radiation"),
+        "direct_radiation": current_w.get("direct_radiation"),
+        "diffuse_radiation": current_w.get("diffuse_radiation"),
+        "relative_humidity_2m": current_w.get("relative_humidity_2m"),
+        "precipitation": current_w.get("precipitation"),
+        "is_day": current_w.get("is_day"),
+        "european_aqi": current_a.get("european_aqi"),
+        "pm2_5": current_a.get("pm2_5"),
+        "pm10": current_a.get("pm10"),
+        "nitrogen_dioxide": current_a.get("nitrogen_dioxide"),
+        "ozone": current_a.get("ozone"),
+        "sulphur_dioxide": current_a.get("sulphur_dioxide"),
+        "carbon_monoxide": current_a.get("carbon_monoxide"),
+        "aerosol_optical_depth": current_a.get("aerosol_optical_depth"),
+        "dust": current_a.get("dust"),
+        "uv_index": current_a.get("uv_index"),
+    }
+
+    return {
+        "weather_raw": weather,
+        "air_raw": air,
+        "current_row": row,
     }
 
 
@@ -882,6 +1135,9 @@ def build_place_dataframe(region_name: str, outages_df: pd.DataFrame, simulation
     return pd.DataFrame(rows), raw_cache
 
 
+# =========================================================
+# GRID INTERPOLATION
+# =========================================================
 def interpolate_weather_value(grid_lat, grid_lon, places_df: pd.DataFrame, col: str) -> float:
     weights = []
     values = []
@@ -919,25 +1175,7 @@ def count_outages_near(grid_lat, grid_lon, outages_df: pd.DataFrame, radius_km=2
     return total
 
 
-def get_risk_label(x):
-    x = safe_float(x)
-    if x is None:
-        return "Unknown"
-    if x >= 75:
-        return "Severe"
-    elif x >= 55:
-        return "High"
-    elif x >= 35:
-        return "Moderate"
-    return "Low"
-
-
-def build_digital_twin_grid(
-    region_name: str,
-    places_df: pd.DataFrame,
-    outages_df: pd.DataFrame,
-    scenario_engine=None,
-) -> pd.DataFrame:
+def build_digital_twin_grid(region_name: str, places_df: pd.DataFrame, outages_df: pd.DataFrame, scenario_engine=None) -> pd.DataFrame:
     bbox = REGIONS[region_name]["bbox"]
     min_lon, min_lat, max_lon, max_lat = bbox
 
@@ -974,16 +1212,9 @@ def build_digital_twin_grid(
             }
 
             if scenario_engine is not None:
-                enhanced = enhanced_risk_with_cascade(
-                    base_row,
-                    outage_intensity,
-                    scenario_engine,
-                )
+                enhanced = enhanced_risk_with_cascade(base_row, outage_intensity, scenario_engine)
             else:
-                enhanced = compute_multilayer_risk(
-                    base_row,
-                    outage_intensity,
-                )
+                enhanced = compute_multilayer_risk(base_row, outage_intensity)
                 enhanced["system_stress"] = 0
                 enhanced["final_risk_score"] = enhanced["risk_score"]
                 enhanced["cascade_power"] = 0
@@ -1020,6 +1251,9 @@ def build_digital_twin_grid(
     return pd.DataFrame(cells)
 
 
+# =========================================================
+# TITLE + SIDEBAR
+# =========================================================
 st.title("North East & Yorkshire Grid Digital Twin")
 st.caption("Live digital twin for weather, pollution, solar conditions, satellite layers, outage monitoring and predictive risk screening.")
 
@@ -1048,8 +1282,8 @@ with st.sidebar:
 
     st.markdown("---")
     simulated_wind = st.slider("Simulate wind increase (%)", 0, 100, 0)
-
     mc_runs = st.slider("Monte Carlo simulations", 10, 100, 30)
+
     st.subheader("Digital twin logic")
     st.write(
         """
@@ -1063,6 +1297,10 @@ with st.sidebar:
         """
     )
 
+
+# =========================================================
+# DATA PREP
+# =========================================================
 try:
     raw_npg = fetch_npg_live_power_cuts(limit=outage_limit)
     raw_npg_df = payload_to_df(raw_npg)
@@ -1080,16 +1318,13 @@ try:
         )
         enhanced_rows.append(enhanced)
 
-    enhanced_df = pd.DataFrame(enhanced_rows)
-
-    enhanced_df = enhanced_df.add_prefix("enh_")
+    enhanced_df = pd.DataFrame(enhanced_rows).add_prefix("enh_")
 
     places_df = pd.concat(
         [places_df.reset_index(drop=True), enhanced_df.reset_index(drop=True)],
         axis=1,
     )
-    
-    # overwrite with enhanced model outputs
+
     places_df["risk_score"] = places_df["enh_risk_score"]
     places_df["failure_probability"] = places_df["enh_failure_probability"]
     places_df["net_load"] = places_df["enh_net_load"]
@@ -1114,12 +1349,7 @@ try:
         + pd.to_numeric(places_df["wind_speed_10m"], errors="coerce").fillna(0) * 0.4
     )
 
-    digital_twin_df = build_digital_twin_grid(
-        region_name,
-        places_df,
-        outages_df,
-        scenario_engine,
-    )
+    digital_twin_df = build_digital_twin_grid(region_name, places_df, outages_df, scenario_engine)
     digital_twin_df = digital_twin_df[digital_twin_df["risk_score"] >= risk_filter]
 
     selected_weather = raw_cache[selected_place]["weather_raw"]
@@ -1131,6 +1361,10 @@ except Exception as e:
     st.error(f"Data fetch failed: {e}")
     st.stop()
 
+
+# =========================================================
+# TOP METRICS
+# =========================================================
 regional_risk = round(float(places_df["risk_score"].mean()), 1) if not places_df.empty and "risk_score" in places_df.columns else 0
 regional_failure_prob = round(float(places_df["failure_probability"].mean()) * 100, 1) if not places_df.empty and "failure_probability" in places_df.columns else 0
 live_outages = len(outages_df)
@@ -1146,14 +1380,12 @@ m5.metric("Solar radiation", solar_value)
 m6.metric("European AQI", f"{selected_current.get('european_aqi', '—')}")
 m7.metric("Renewable potential", round(float(places_df["renewable_score"].mean()), 1) if "renewable_score" in places_df.columns else 0)
 m8.metric("Grid net load", round(float(places_df["net_load"].mean()), 2) if "net_load" in places_df.columns else 0)
+
 st.info(solar_note)
 
 st.markdown("### 🔬 Scenario-adjusted system state")
 
-# Apply scenario to selected location
 scenario_row = scenario_engine.apply(selected_current)
-
-# recompute renewable + load + risk under scenario
 scenario_risk = compute_multilayer_risk(
     scenario_row,
     outage_intensity=clamp(live_outages / 25, 0, 1)
@@ -1164,35 +1396,17 @@ scenario_solar = safe_float(scenario_row.get("shortwave_radiation")) or 0
 scenario_aqi = safe_float(scenario_row.get("european_aqi")) or 0
 
 sc1, sc2, sc3, sc4, sc5 = st.columns(5)
-
 sc1.metric(
     "Scenario wind",
     f"{round(scenario_wind,1)} km/h",
-    delta=round(scenario_wind - (safe_float(selected_current.get("wind_speed_10m")) or 0),1)
+    delta=round(scenario_wind - (safe_float(selected_current.get("wind_speed_10m")) or 0), 1)
 )
-
-sc2.metric(
-    "Scenario solar",
-    f"{round(scenario_solar,1)} W/m²"
-)
-
-sc3.metric(
-    "Scenario AQI",
-    round(scenario_aqi,1)
-)
-
-sc4.metric(
-    "Scenario renewable",
-    scenario_risk["renewable_generation"]
-)
-
-sc5.metric(
-    "Scenario net load",
-    scenario_risk["net_load"]
-)
+sc2.metric("Scenario solar", f"{round(scenario_solar,1)} W/m²")
+sc3.metric("Scenario AQI", round(scenario_aqi, 1))
+sc4.metric("Scenario renewable", scenario_risk["renewable_generation"])
+sc5.metric("Scenario net load", scenario_risk["net_load"])
 
 st.markdown("### ⚡ System Status")
-
 if regional_risk >= 70:
     st.error("CRITICAL GRID RISK — Immediate action required")
 elif regional_risk >= 55:
@@ -1202,18 +1416,41 @@ elif regional_risk >= 35:
 else:
     st.success("System stable")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+
+# =========================================================
+# TABS
+# =========================================================
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Digital Twin Map",
     "Regional Intelligence",
     "Selected Site Forecast",
     "Live Outages",
     "Raw Twin Grid",
+    "CReDo Network"
 ])
 
-with tab1:
-    st.subheader(f"{region_name} live digital twin map")
 
-    center = REGIONS[region_name]["center"]
+# =========================================================
+# TAB 1
+# =========================================================
+with tab1:
+    selected_node = st.session_state.get("credo_selected_node")
+    selected_place_from_graph = get_place_from_node(selected_node) if selected_node else None
+
+    if selected_place_from_graph and "place" in places_df.columns:
+        selected_rows = places_df[places_df["place"] == selected_place_from_graph]
+        if not selected_rows.empty:
+            center = {
+                "lat": safe_float(selected_rows.iloc[0].get("lat")) or REGIONS[region_name]["center"]["lat"],
+                "lon": safe_float(selected_rows.iloc[0].get("lon")) or REGIONS[region_name]["center"]["lon"],
+                "zoom": 10
+            }
+        else:
+            center = REGIONS[region_name]["center"]
+    else:
+        center = REGIONS[region_name]["center"]
+
+    st.subheader(f"{region_name} live digital twin map")
 
     base_tiles = {
         "Satellite-style dark": "CartoDB dark_matter",
@@ -1241,7 +1478,7 @@ with tab1:
         folium.raster_layers.TileLayer(
             tiles=tile_url,
             attr="NASA GIBS",
-            name=f"{satellite_name} overlay",
+            name=f"{satellite_name}",
             overlay=True,
             control=True,
             opacity=0.55,
@@ -1253,247 +1490,193 @@ with tab1:
     folium.Polygon(
         locations=region_polygon_latlon,
         color="orange",
-        weight=3,
+        weight=2,
         fill=True,
-        fill_color="orange",
-        fill_opacity=0.06,
-        popup=f"{region_name} region boundary",
+        fill_opacity=0.05,
     ).add_to(m)
+
+    # optional flood / water proxy tile
+    try:
+        water_mask_tile = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_WaterMask/default/{date}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.png".replace(
+            "{date}", datetime.utcnow().strftime("%Y-%m-%d")
+        )
+        folium.raster_layers.TileLayer(
+            tiles=water_mask_tile,
+            attr="NASA GIBS Water Mask",
+            name="Water / flood mask",
+            overlay=True,
+            control=True,
+            opacity=0.30,
+        ).add_to(m)
+    except Exception:
+        pass
 
     if not digital_twin_df.empty:
         twin_df = digital_twin_df.copy()
+        max_risk = twin_df["risk_score"].max() if "risk_score" in twin_df else 1
+        max_risk = max(max_risk, 1)
 
-        if "risk_score" in twin_df.columns:
-            max_risk = twin_df["risk_score"].max()
-            max_risk = max_risk if pd.notna(max_risk) and max_risk > 0 else 1.0
-            twin_df["risk_weight"] = twin_df["risk_score"] / max_risk
-        else:
-            twin_df["risk_weight"] = 0.2
-
-        heat_data = []
-        for _, row in twin_df.iterrows():
-            lat = safe_float(row.get("lat"))
-            lon = safe_float(row.get("lon"))
-            weight = safe_float(row.get("risk_weight"))
-            if lat is not None and lon is not None and weight is not None:
-                heat_data.append([lat, lon, weight])
+        heat_data = [
+            [safe_float(r["lat"]), safe_float(r["lon"]), (safe_float(r["risk_score"]) or 0) / max_risk]
+            for _, r in twin_df.iterrows()
+            if safe_float(r["lat"]) and safe_float(r["lon"])
+        ]
 
         if heat_data:
             HeatMap(
                 heat_data,
-                name="Digital twin risk heatmap",
+                radius=30,
+                blur=22,
                 min_opacity=0.25,
-                radius=28,
-                blur=20,
-                max_zoom=12,
+                name="Risk heatmap"
             ).add_to(m)
 
     if not digital_twin_df.empty:
-        twin_df = digital_twin_df.copy()
-        for _, row in twin_df.iterrows():
-            row = row.to_dict()
-
+        for _, row in digital_twin_df.iterrows():
             lat = safe_float(row.get("lat"))
             lon = safe_float(row.get("lon"))
             if lat is None or lon is None:
                 continue
 
-            risk_score = safe_float(row.get("final_risk_score")) or 0
-            risk_label = row.get("risk_label", "Unknown")
-            wind = safe_float(row.get("wind_speed_10m"))
-            aqi = safe_float(row.get("aqi"))
-            solar = safe_float(row.get("solar"))
-            outages_near = row.get("outages_near_20km", 0)
-
-            if risk_score >= 75:
-                colour = "darkred"
-            elif risk_score >= 55:
-                colour = "red"
-            elif risk_score >= 35:
-                colour = "orange"
-            else:
-                colour = "green"
-
+            risk = safe_float(row.get("final_risk_score")) or 0
             stress = safe_float(row.get("system_stress")) or 0
 
-            if stress > 0.7:
+            if stress > 0.7 or risk > 80:
                 colour = "darkred"
-            elif stress > 0.5:
+            elif stress > 0.5 or risk > 60:
                 colour = "red"
-            elif stress > 0.3:
-                colour = "orange"
-            else:
-                colour = colour
-
-            folium.CircleMarker(
-                location=[lat, lon],
-                radius=10,
-                color=colour,
-                weight=2,
-                fill=True,
-                fill_color=colour,
-                fill_opacity=0.95,
-                popup=folium.Popup(
-                    f"""
-                    <b>Digital Twin Cell</b><br>
-                    Risk score: {risk_score}<br>
-                    System stress: {round(stress, 2)}<br>
-                    Risk label: {risk_label}<br>
-                    Wind: {wind}<br>
-                    AQI: {aqi}<br>
-                    Solar: {solar}<br>
-                    Nearby outages (20 km): {outages_near}
-                    """,
-                    max_width=320,
-                ),
-            ).add_to(m)
-
-    if not places_df.empty:
-        place_map_df = places_df.copy()
-        for _, row in place_map_df.iterrows():
-            row = row.to_dict()
-            lat = safe_float(row.get("lat"))
-            lon = safe_float(row.get("lon"))
-            if lat is None or lon is None:
-                continue
-
-            risk_score = safe_float(row.get("final_risk_score")) or 0
-            failure_prob = safe_float(row.get("failure_probability")) or 0
-            wind = safe_float(row.get("wind_speed_10m"))
-            aqi = safe_float(row.get("european_aqi"))
-            solar = safe_float(row.get("shortwave_radiation"))
-            nearby_outages = row.get("nearby_outages_25km", 0)
-            place = row.get("place", "Unknown place")
-
-            if risk_score >= 75:
-                colour = "darkred"
-            elif risk_score >= 55:
-                colour = "red"
-            elif risk_score >= 35:
+            elif risk > 40:
                 colour = "orange"
             else:
                 colour = "green"
 
             folium.CircleMarker(
                 location=[lat, lon],
-                radius=10,
-                color="white",
-                weight=2,
+                radius=9,
+                color=colour,
                 fill=True,
-                fill_color=colour,
-                fill_opacity=0.95,
-                popup=folium.Popup(
-                    f"""
-                    <b>{place}</b><br>
-                    Risk score: {risk_score}<br>
-                    Failure probability: {round(failure_prob * 100, 1)}%<br>
-                    Wind speed: {wind} km/h<br>
-                    AQI: {aqi}<br>
-                    Solar radiation: {solar} W/m²<br>
-                    Nearby outages (25 km): {nearby_outages}
-                    """,
-                    max_width=320,
-                ),
-                tooltip=f"{place} | Risk {risk_score}",
+                fill_opacity=0.9,
+                popup=f"""
+                <b>Digital Twin Cell</b><br>
+                Risk: {round(risk,1)}<br>
+                Stress: {round(stress,2)}<br>
+                Wind: {row.get("wind_speed_10m")}<br>
+                AQI: {row.get("aqi")}<br>
+                """
             ).add_to(m)
 
-    outage_points_df = pd.DataFrame()
-    if (
-        not outages_df.empty
-        and "latitude" in outages_df.columns
-        and "longitude" in outages_df.columns
-    ):
-        outage_points_df = outages_df.copy()
-        outage_points_df["latitude"] = pd.to_numeric(outage_points_df["latitude"], errors="coerce")
-        outage_points_df["longitude"] = pd.to_numeric(outage_points_df["longitude"], errors="coerce")
-        outage_points_df = outage_points_df.dropna(subset=["latitude", "longitude"]).copy()
+    def generate_infra_nodes(df):
+        nodes = []
+        for _, r in df.iterrows():
+            lat = safe_float(r.get("lat"))
+            lon = safe_float(r.get("lon"))
+            if lat is None or lon is None:
+                continue
+            nodes.append(("power", lat, lon))
+            nodes.append(("water", lat + 0.02, lon + 0.02))
+            nodes.append(("telecom", lat - 0.02, lon - 0.02))
+        return nodes
 
-    if not outage_points_df.empty:
-        outage_layer = folium.FeatureGroup(name="Live outages", show=True)
+    infra_nodes = generate_infra_nodes(places_df)
+    colour_map = {"power": "yellow", "water": "blue", "telecom": "purple"}
 
-        for _, row in outage_points_df.iterrows():
+    for t, lat, lon in infra_nodes:
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=5,
+            color=colour_map.get(t, "white"),
+            fill=True,
+            fill_opacity=0.9,
+            popup=f"{t} asset"
+        ).add_to(m)
+
+    for i in range(len(infra_nodes) - 1):
+        a = infra_nodes[i]
+        b = infra_nodes[i + 1]
+        folium.PolyLine(
+            locations=[[a[1], a[2]], [b[1], b[2]]],
+            color="yellow",
+            weight=1,
+            opacity=0.3
+        ).add_to(m)
+
+    if not digital_twin_df.empty:
+        for _, row in digital_twin_df.iterrows():
+            risk = safe_float(row.get("final_risk_score")) or 0
+            if risk > 65:
+                folium.Circle(
+                    location=[row["lat"], row["lon"]],
+                    radius=2000,
+                    color="blue",
+                    fill=True,
+                    fill_opacity=0.08
+                ).add_to(m)
+
+    for _, row in places_df.iterrows():
+        lat = safe_float(row.get("lat"))
+        lon = safe_float(row.get("lon"))
+        if lat is None or lon is None:
+            continue
+
+        risk = safe_float(row.get("final_risk_score")) or 0
+        is_selected_from_graph = selected_place_from_graph == row.get("place")
+
+        if risk > 75:
+            colour = "darkred"
+        elif risk > 55:
+            colour = "red"
+        elif risk > 35:
+            colour = "orange"
+        else:
+            colour = "green"
+
+        marker_radius = 14 if is_selected_from_graph else 10
+        marker_border = "red" if is_selected_from_graph else "white"
+
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=marker_radius,
+            color=marker_border,
+            weight=2,
+            fill=True,
+            fill_color=colour,
+            fill_opacity=0.95,
+            tooltip=f"{row['place']} | Risk {risk}",
+        ).add_to(m)
+
+    if not outages_df.empty:
+        for _, row in outages_df.iterrows():
             lat = safe_float(row.get("latitude"))
             lon = safe_float(row.get("longitude"))
             if lat is None or lon is None:
                 continue
 
-            popup_html = f"""
-            <b>Power outage</b><br>
-            Reference: {row.get('outage_reference', 'N/A')}<br>
-            Status: {row.get('outage_status', 'Unknown')}<br>
-            Category: {row.get('outage_category', 'Unknown')}<br>
-            Customers affected: {row.get('affected_customers', '')}<br>
-            Postcode: {row.get('postcode_label', '')}<br>
-            Estimated restore: {row.get('estimated_restore', '')}
-            """
-
             folium.Marker(
                 location=[lat, lon],
-                popup=folium.Popup(popup_html, max_width=340),
-                tooltip=f"Outage | {row.get('outage_status', 'Unknown')}",
-                icon=folium.Icon(color="red", icon="flash", prefix="glyphicon"),
-            ).add_to(outage_layer)
-
-        outage_layer.add_to(m)
+                icon=folium.Icon(color="red", icon="flash"),
+                tooltip="Outage"
+            ).add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
 
-    legend_html = """
-    <div style="
-        position: fixed;
-        bottom: 30px;
-        left: 30px;
-        z-index: 9999;
-        background-color: rgba(20, 20, 20, 0.88);
-        color: white;
-        padding: 12px 14px;
-        border-radius: 8px;
-        font-size: 12px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.35);
-    ">
-        <b>Digital Twin Risk</b><br>
-        <span style="color:green;">●</span> Low<br>
-        <span style="color:orange;">●</span> Moderate<br>
-        <span style="color:red;">●</span> High<br>
-        <span style="color:darkred;">●</span> Severe<br>
-        <span style="color:#ff4d4d;">⬤</span> Live outage marker
-    </div>
-    """
-    m.get_root().html.add_child(folium.Element(legend_html))
-
-    st.caption("Click map markers to inspect local grid conditions")
-    components.html(m._repr_html_(), height=700)
+    st.caption("CReDo-style multi-layer digital twin (risk, infrastructure, cascade, hazard)")
+    components.html(m._repr_html_(), height=720)
 
     c1, c2, c3 = st.columns(3)
+    c1.metric("High-risk cells", len(digital_twin_df[digital_twin_df["risk_score"] > 55]))
+    c2.metric("Severe cells", len(digital_twin_df[digital_twin_df["risk_score"] > 75]))
+    if not places_df.empty:
+        worst = places_df.sort_values("risk_score", ascending=False).iloc[0]["place"]
+        c3.metric("Highest-risk location", worst)
 
-    with c1:
-        risky_cells = (
-            digital_twin_df[digital_twin_df["risk_score"] >= 55]
-            if not digital_twin_df.empty and "risk_score" in digital_twin_df.columns
-            else pd.DataFrame()
-        )
-        st.metric("High-risk twin cells", len(risky_cells))
 
-    with c2:
-        severe_cells = (
-            digital_twin_df[digital_twin_df["risk_score"] >= 75]
-            if not digital_twin_df.empty and "risk_score" in digital_twin_df.columns
-            else pd.DataFrame()
-        )
-        st.metric("Severe-risk twin cells", len(severe_cells))
-
-    with c3:
-        if not places_df.empty and "risk_score" in places_df.columns:
-            worst_place = places_df.sort_values("risk_score", ascending=False).iloc[0]["place"]
-            st.metric("Highest-risk place", worst_place)
-        else:
-            st.metric("Highest-risk place", "N/A")
-
+# =========================================================
+# TAB 2
+# =========================================================
 with tab2:
     st.subheader(f"{region_name} regional intelligence")
 
     k1, k2, k3, k4 = st.columns(4)
-
     avg_risk = round(float(places_df.get("risk_score", pd.Series([0])).mean()), 1)
     max_risk = round(float(places_df.get("risk_score", pd.Series([0])).max()), 1)
     avg_aqi = round(float(places_df.get("european_aqi", pd.Series([0])).mean()), 1)
@@ -1505,12 +1688,10 @@ with tab2:
     k4.metric("Avg wind (km/h)", avg_wind)
 
     st.markdown("---")
-
     left, right = st.columns([1.1, 1])
 
     with left:
         st.markdown("### Representative location risk table")
-
         display_cols = [
             "place", "temperature_2m", "wind_speed_10m",
             "shortwave_radiation", "cloud_cover", "precipitation",
@@ -1519,17 +1700,12 @@ with tab2:
             "risk_score", "failure_probability",
             "net_load", "renewable_generation",
         ]
-
         df_safe = places_df.reindex(columns=display_cols)
 
         if "risk_score" in df_safe.columns:
             df_safe = df_safe.sort_values("risk_score", ascending=False)
 
-        st.dataframe(
-            df_safe,
-            use_container_width=True,
-            height=320,
-        )
+        st.dataframe(df_safe, use_container_width=True, height=320)
 
     with right:
         st.markdown("### Top vulnerable areas")
@@ -1557,14 +1733,12 @@ with tab2:
 
     st.markdown("---")
     st.markdown("### Cascading infrastructure stress")
-
     if "system_stress" in places_df.columns:
         plot_df = places_df[["place", "system_stress"]].copy()
         plot_df["system_stress"] = pd.to_numeric(plot_df["system_stress"], errors="coerce").fillna(0)
         st.bar_chart(plot_df.set_index("place")["system_stress"])
 
     st.markdown("### Infrastructure breakdown")
-
     for _, r in places_df.iterrows():
         st.write(
             f"{r['place']} → "
@@ -1574,7 +1748,6 @@ with tab2:
         )
 
     st.markdown("### Predicted risk trend (next 24h)")
-
     if not hourly_df.empty and "predicted_risk_score" in hourly_df.columns:
         st.line_chart(hourly_df["predicted_risk_score"])
     else:
@@ -1582,21 +1755,15 @@ with tab2:
 
     st.markdown("---")
     st.markdown("### Renewable energy potential")
-
     if not places_df.empty:
         places_df["renewable_score"] = (
             pd.to_numeric(places_df.get("shortwave_radiation", 0), errors="coerce").fillna(0) * 0.6
             + pd.to_numeric(places_df.get("wind_speed_10m", 0), errors="coerce").fillna(0) * 0.4
         )
-
-        st.metric(
-            "Regional renewable potential",
-            round(float(places_df["renewable_score"].mean()), 1),
-        )
+        st.metric("Regional renewable potential", round(float(places_df["renewable_score"].mean()), 1))
 
     st.markdown("---")
     st.markdown("### System interpretation")
-
     if avg_risk >= 70:
         st.error("Critical grid stress driven by extreme environmental conditions and outage clustering.")
     elif avg_risk >= 55:
@@ -1608,7 +1775,6 @@ with tab2:
 
     st.markdown("---")
     st.markdown("### AI interpretation")
-
     if regional_risk > 60:
         st.write("High wind and pollution levels are driving elevated grid stress.")
     elif regional_risk > 40:
@@ -1618,7 +1784,6 @@ with tab2:
 
     st.markdown("---")
     st.markdown("### Regional digital twin summary")
-
     twin_summary = pd.DataFrame({
         "Metric": [
             "Average risk score",
@@ -1640,21 +1805,13 @@ with tab2:
         ],
     })
 
-
     st.markdown("### ⏱️ Cascading failure timeline (CReDo style)")
-
     if not places_df.empty:
         sample_place = places_df.iloc[0].to_dict()
+        timeline_df = run_time_simulation(sample_place, outage_intensity=0.3, scenario_engine=scenario_engine)
+        st.line_chart(timeline_df.set_index("hour")[["risk"]])
 
-        timeline_df = run_time_simulation(
-            sample_place,
-            outage_intensity=0.3,
-            scenario_engine=scenario_engine
-        )
-
-        st.line_chart(timeline_df.set_index("hour")[["risk"]])    
     st.markdown("### 🔬 Uncertainty (Monte Carlo)")
-
     for _, r in places_df.iterrows():
         st.write(
             f"{r.get('place', 'Unknown')} → "
@@ -1664,6 +1821,10 @@ with tab2:
 
     st.dataframe(twin_summary, use_container_width=True, hide_index=True)
 
+
+# =========================================================
+# TAB 3
+# =========================================================
 with tab3:
     st.subheader(f"{selected_place} live and forecast diagnostics")
 
@@ -1706,6 +1867,10 @@ with tab3:
         else:
             st.warning("No hourly forecast available.")
 
+
+# =========================================================
+# TAB 4
+# =========================================================
 with tab4:
     st.subheader(f"Northern Powergrid live outage records — {region_name}")
 
@@ -1725,6 +1890,10 @@ with tab4:
             height=460,
         )
 
+
+# =========================================================
+# TAB 5
+# =========================================================
 with tab5:
     csv = digital_twin_df.to_csv(index=False).encode("utf-8")
 
@@ -1742,6 +1911,452 @@ with tab5:
         height=500,
     )
 
+
+# =========================================================
+# TAB 6
+# =========================================================
+with tab6:
+    st.subheader("CReDo-style cascading failure simulation")
+
+    left_panel, centre_panel, right_panel = st.columns([1.1, 3.2, 1.35])
+
+    with left_panel:
+        st.markdown("### Controls")
+        sim_steps = st.slider("Simulation steps", 6, 30, 14, 1, key="credo_steps")
+        sim_speed = st.slider("Animation delay (seconds)", 0.1, 1.2, 0.45, 0.05, key="credo_speed")
+        auto_run = st.checkbox("Run animation", value=True, key="credo_autorun")
+        show_failure_waves = st.checkbox("Show failure waves", value=True, key="credo_waves")
+        show_cross_region_links = st.checkbox("Show cross-place links", value=True, key="credo_crosslinks")
+        manual_step = st.slider("Manual step", 0, sim_steps - 1, st.session_state.get("credo_last_step", 0), 1, key="credo_manual_step")
+        st.caption("Node click opens detailed metadata and syncs the map below.")
+
+    G = nx.DiGraph()
+    place_lookup = {}
+    place_names = list(places_df["place"]) if "place" in places_df.columns else []
+
+    # graph build
+    for _, r in places_df.iterrows():
+        place = str(r.get("place"))
+        row = r.to_dict()
+        place_lookup[place] = row
+        flood_depth = infer_flood_depth_for_place(row, scenario_choice)
+
+        G.add_node(
+            place,
+            type="city",
+            label=place,
+            parent_place=place,
+            state=0,
+            flood_depth=flood_depth,
+            direct_prob=0.0,
+            indirect_prob=0.0,
+        )
+
+        for asset_type in ["power", "water", "telecom"]:
+            node_name = f"{place}_{asset_type}"
+            G.add_node(
+                node_name,
+                type=asset_type,
+                label=node_name,
+                parent_place=place,
+                state=0,
+                flood_depth=flood_depth,
+                direct_prob=0.0,
+                indirect_prob=0.0,
+            )
+
+        # local dependencies
+        G.add_edge(f"{place}_power", f"{place}_telecom")
+        G.add_edge(f"{place}_power", f"{place}_water")
+        G.add_edge(f"{place}_telecom", f"{place}_water")
+        G.add_edge(f"{place}_power", place)
+        G.add_edge(f"{place}_water", place)
+        G.add_edge(f"{place}_telecom", place)
+
+    if show_cross_region_links:
+        for i in range(len(place_names) - 1):
+            a = place_names[i]
+            b = place_names[i + 1]
+            G.add_edge(f"{a}_power", f"{b}_power")
+            G.add_edge(f"{a}_telecom", f"{b}_telecom")
+            G.add_edge(f"{a}_water", f"{b}_water")
+
+    pos = build_credo_layout(place_names)
+
+    # initial seeding
+    for place, row in place_lookup.items():
+        flood_depth = infer_flood_depth_for_place(row, scenario_choice)
+        outages = safe_float(row.get("nearby_outages_25km")) or 0.0
+        p_fail = direct_failure_probability("power", row, flood_depth, t=0)
+
+        if outages > 3:
+            p_fail = clamp(p_fail + 0.20, 0.0, 0.95)
+
+        if random.random() < p_fail * 0.75:
+            G.nodes[f"{place}_power"]["state"] = 2
+        elif random.random() < p_fail:
+            G.nodes[f"{place}_power"]["state"] = 1
+
+    selected_node_name = st.session_state.get("credo_selected_node", place_names[0] if place_names else None)
+
+    def make_figure(step_idx: int, failed_wave_nodes: List[str], selected_node_name: Optional[str]):
+        edge_x, edge_y = [], []
+        for src, dst in G.edges():
+            x0, y0 = pos[src]
+            x1, y1 = pos[dst]
+            edge_x += [x0, x1, None]
+            edge_y += [y0, y1, None]
+
+        edge_trace = go.Scatter(
+            x=edge_x,
+            y=edge_y,
+            mode="lines",
+            hoverinfo="none",
+            line=dict(width=1.2, color="rgba(180,180,180,0.25)")
+        )
+
+        node_x, node_y = [], []
+        node_text, node_hover = [], []
+        node_colors, node_sizes, node_symbols = [], [], []
+        customdata = []
+        glow_traces = []
+
+        for node_name, data in G.nodes(data=True):
+            x, y = pos[node_name]
+            node_type = data.get("type", "city")
+            state = data.get("state", 0)
+            parent_place = data.get("parent_place", node_name)
+
+            row = place_lookup.get(parent_place, {})
+            wind = safe_float(row.get("wind_speed_10m")) or 0.0
+            rain = safe_float(row.get("precipitation")) or 0.0
+            outages = safe_float(row.get("nearby_outages_25km")) or 0.0
+            aqi = safe_float(row.get("european_aqi")) or 0.0
+
+            node_x.append(x)
+            node_y.append(y)
+
+            is_selected = selected_node_name == node_name
+
+            size = 20 if node_type == "city" else 16 if node_type == "power" else 13
+            if state == 2:
+                size += 4
+            elif state == 1:
+                size += 2
+            if is_selected:
+                size += 8
+
+            node_sizes.append(size)
+            node_symbols.append(node_marker_symbol(node_type))
+            node_colors.append(node_display_colour(node_type, state))
+
+            label_text = f"{node_icon(node_type)} {node_name.replace('_', ' ')}"
+            node_text.append(label_text)
+
+            node_hover.append(
+                "<br>".join([
+                    f"<b>{node_name}</b>",
+                    f"Type: {node_type}",
+                    f"State: {['Normal', 'Stressed', 'Failed'][state]}",
+                    f"Wind: {wind:.1f} km/h",
+                    f"Rain: {rain:.1f} mm",
+                    f"AQI: {aqi:.1f}",
+                    f"Nearby outages: {outages:.0f}",
+                    f"Flood depth proxy: {data.get('flood_depth', 0.0):.2f} m",
+                    f"Direct failure p: {data.get('direct_prob', 0.0):.3f}",
+                    f"Dependency failure p: {data.get('indirect_prob', 0.0):.3f}",
+                ])
+            )
+
+            customdata.append(node_name)
+
+            if state == 2:
+                glow_traces.append(
+                    go.Scatter(
+                        x=[x],
+                        y=[y],
+                        mode="markers",
+                        marker=dict(
+                            size=size + 22,
+                            color="rgba(255,59,48,0.14)",
+                            line=dict(width=2, color="rgba(255,59,48,0.40)")
+                        ),
+                        hoverinfo="none",
+                        showlegend=False
+                    )
+                )
+
+            if show_failure_waves and node_name in failed_wave_nodes:
+                glow_traces.append(
+                    go.Scatter(
+                        x=[x],
+                        y=[y],
+                        mode="markers",
+                        marker=dict(
+                            size=size + 34,
+                            color="rgba(255,100,100,0.08)",
+                            line=dict(width=1, color="rgba(255,100,100,0.25)")
+                        ),
+                        hoverinfo="none",
+                        showlegend=False
+                    )
+                )
+
+        node_trace = go.Scatter(
+            x=node_x,
+            y=node_y,
+            mode="markers+text",
+            text=node_text,
+            textposition="top center",
+            hoverinfo="text",
+            hovertext=node_hover,
+            customdata=customdata,
+            marker=dict(
+                size=node_sizes,
+                color=node_colors,
+                symbol=node_symbols,
+                line=dict(width=1.5, color="white"),
+            ),
+            textfont=dict(size=12, color="white"),
+        )
+
+        fig = go.Figure(data=[edge_trace] + glow_traces + [node_trace])
+
+        fig.update_layout(
+            title=f"⚡ CReDo Cascade Simulation — Step {step_idx}",
+            showlegend=False,
+            plot_bgcolor="#0e1117",
+            paper_bgcolor="#0e1117",
+            font=dict(color="white"),
+            margin=dict(l=10, r=10, t=45, b=10),
+            xaxis=dict(showgrid=False, zeroline=False, visible=False),
+            yaxis=dict(showgrid=False, zeroline=False, visible=False),
+            clickmode="event+select"
+        )
+
+        return fig
+
+    # precompute step history so manual step works
+    history = []
+    wave_history = []
+
+    sim_graph = G.copy()
+
+    for t in range(sim_steps):
+        next_states = {}
+        failed_wave_nodes = []
+
+        for node_name, data in sim_graph.nodes(data=True):
+            node_type = data.get("type", "city")
+            place = data.get("parent_place", node_name)
+            row = place_lookup.get(place, {})
+            flood_depth = data.get("flood_depth", 0.0)
+            current_state = data.get("state", 0)
+
+            d_prob = direct_failure_probability(node_type, row, flood_depth, t)
+            sim_graph.nodes[node_name]["direct_prob"] = d_prob
+
+            incoming_neighbors = list(sim_graph.predecessors(node_name))
+            failed_upstream = sum(sim_graph.nodes[n].get("state", 0) == 2 for n in incoming_neighbors)
+            stressed_upstream = sum(sim_graph.nodes[n].get("state", 0) == 1 for n in incoming_neighbors)
+
+            if node_type == "city":
+                if failed_upstream >= 2:
+                    i_prob = 0.55
+                elif failed_upstream == 1 or stressed_upstream >= 2:
+                    i_prob = 0.28
+                elif stressed_upstream == 1:
+                    i_prob = 0.10
+                else:
+                    i_prob = 0.02
+            else:
+                total_in = max(len(incoming_neighbors), 1)
+                i_prob = (failed_upstream * 1.0 + stressed_upstream * 0.45) / total_in
+                if node_type == "water":
+                    i_prob *= 1.35
+                elif node_type == "telecom":
+                    i_prob *= 1.15
+                elif node_type == "power":
+                    i_prob *= 1.05
+
+            i_prob = clamp(i_prob, 0.0, 0.95)
+            sim_graph.nodes[node_name]["indirect_prob"] = i_prob
+
+            combined_fail_prob = clamp(0.55 * d_prob + 0.45 * i_prob, 0.0, 0.75)
+            recover_prob = recovery_probability(node_type, flood_depth, t) * 1.5
+            recover_prob = clamp(recover_prob, 0.0, 0.45)
+
+            if current_state == 2:
+                if random.random() < recover_prob:
+                    next_states[node_name] = 1
+                else:
+                    next_states[node_name] = 2
+                continue
+
+            if current_state == 1:
+                escalate_prob = clamp(combined_fail_prob + 0.10, 0.0, 0.90)
+                recover_to_normal_prob = clamp(recover_prob * 0.75, 0.0, 0.55)
+
+                u = random.random()
+                if u < escalate_prob:
+                    next_states[node_name] = 2
+                    failed_wave_nodes.append(node_name)
+                elif u < escalate_prob + recover_to_normal_prob:
+                    next_states[node_name] = 0
+                else:
+                    next_states[node_name] = 1
+                continue
+
+            if node_type == "city":
+                fail_prob = combined_fail_prob * 0.25
+                stress_prob = combined_fail_prob * 0.65
+            else:
+                fail_prob = combined_fail_prob * 0.55
+                stress_prob = combined_fail_prob * 0.90
+
+            u = random.random()
+            if u < fail_prob:
+                next_states[node_name] = 2
+                failed_wave_nodes.append(node_name)
+            elif u < fail_prob + stress_prob:
+                next_states[node_name] = 1
+            else:
+                next_states[node_name] = 0
+
+        for node_name, state in next_states.items():
+            sim_graph.nodes[node_name]["state"] = state
+
+        history.append(sim_graph.copy())
+        wave_history.append(list(failed_wave_nodes))
+
+    # autoplay or manual
+    if auto_run:
+        active_step = sim_steps - 1
+        for t in range(sim_steps):
+            fig = make_figure(t, wave_history[t], selected_node_name)
+
+            with centre_panel:
+                clicked = plotly_events(
+                    fig,
+                    click_event=True,
+                    select_event=False,
+                    hover_event=False,
+                    override_height=640,
+                    key=f"credo_plot_autoplay_{t}"
+                )
+
+            if clicked:
+                point_index = clicked[0].get("pointIndex")
+                if point_index is not None:
+                    node_trace_index = len(fig.data) - 1
+                    try:
+                        clicked_node = fig.data[node_trace_index].customdata[point_index]
+                        if clicked_node in history[t].nodes:
+                            selected_node_name = clicked_node
+                            st.session_state["credo_selected_node"] = clicked_node
+                    except Exception:
+                        pass
+
+            st.session_state["credo_last_step"] = t
+            active_step = t
+            time.sleep(sim_speed)
+    else:
+        active_step = manual_step
+        st.session_state["credo_last_step"] = active_step
+
+        fig = make_figure(active_step, wave_history[active_step], selected_node_name)
+
+        with centre_panel:
+            clicked = plotly_events(
+                fig,
+                click_event=True,
+                select_event=False,
+                hover_event=False,
+                override_height=640,
+                key=f"credo_plot_manual_{active_step}"
+            )
+
+        if clicked:
+            point_index = clicked[0].get("pointIndex")
+            if point_index is not None:
+                node_trace_index = len(fig.data) - 1
+                try:
+                    clicked_node = fig.data[node_trace_index].customdata[point_index]
+                    if clicked_node in history[active_step].nodes:
+                        selected_node_name = clicked_node
+                        st.session_state["credo_selected_node"] = clicked_node
+                except Exception:
+                    pass
+
+    active_graph = history[active_step] if history else G
+
+    if not selected_node_name and place_names:
+        selected_node_name = place_names[0]
+
+    selected_place_name = get_place_from_node(selected_node_name) if selected_node_name else None
+    selected_data = active_graph.nodes[selected_node_name] if selected_node_name in active_graph.nodes else {}
+
+    with right_panel:
+        st.markdown("### Asset metadata")
+        if selected_node_name in active_graph.nodes:
+            row = place_lookup.get(selected_place_name, {})
+            st.markdown(
+                f"""
+                **Selected node**  
+                {selected_node_name}
+
+                **Type**  
+                {selected_data.get('type', 'Unknown')}
+
+                **State**  
+                {['Normal', 'Stressed', 'Failed'][selected_data.get('state', 0)]}
+
+                **Flood depth proxy**  
+                {selected_data.get('flood_depth', 0.0):.2f} m
+
+                **Direct failure probability**  
+                {selected_data.get('direct_prob', 0.0):.3f}
+
+                **Dependency failure probability**  
+                {selected_data.get('indirect_prob', 0.0):.3f}
+
+                **Wind**  
+                {safe_float(row.get('wind_speed_10m')) or 0:.1f} km/h
+
+                **Rain**  
+                {safe_float(row.get('precipitation')) or 0:.1f} mm
+
+                **AQI**  
+                {safe_float(row.get('european_aqi')) or 0:.1f}
+
+                **Nearby outages**  
+                {safe_float(row.get('nearby_outages_25km')) or 0:.0f}
+                """
+            )
+
+            st.markdown("### Interpretation")
+            node_state = selected_data.get("state", 0)
+            if node_state == 2:
+                st.error("This asset is currently failed in the simulation.")
+            elif node_state == 1:
+                st.warning("This asset is under stress and may escalate.")
+            else:
+                st.success("This asset is currently stable.")
+
+    st.markdown("### Synced flood and outage map")
+    synced_map = build_synced_credo_map(
+        region_name=region_name,
+        selected_place_name=selected_place_name,
+        places_df=places_df,
+        outages_df=outages_df,
+        scenario_choice=scenario_choice,
+    )
+    components.html(synced_map._repr_html_(), height=640)
+
+
+# =========================================================
+# FOOTER
+# =========================================================
 st.markdown("---")
 st.markdown(
     """
@@ -1750,5 +2365,6 @@ st.markdown(
     - Solar radiation values close to zero are physically expected during night-time conditions.
     - The digital twin risk layer is a predictive screening layer, not a formal operator-grade protection model.
     - Regional outage matching is robust but still depends on the live schema exposed by the Northern Powergrid dataset.
+    - The flood layer used in the CReDo network tab is currently a proxy depth layer. Replace it with a real raster or model output for higher-fidelity flood analytics.
     """
 )
