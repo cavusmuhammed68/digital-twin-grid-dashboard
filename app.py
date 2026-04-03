@@ -576,6 +576,8 @@ class ScenarioEngine:
         row["wind_speed_10m"] = (safe_float(row.get("wind_speed_10m")) or 0) * self.params["wind"]
         row["precipitation"] = (safe_float(row.get("precipitation")) or 0) * self.params["rain"]
         row["temperature_2m"] = (safe_float(row.get("temperature_2m")) or 0) + self.params["temp"]
+        row["shortwave_radiation"] *= (1 - 0.3 * self.params["rain"])
+        row["european_aqi"] *= (1 + 0.4 * self.params["infra"])
         return row
 
 
@@ -1145,6 +1147,49 @@ m6.metric("European AQI", f"{selected_current.get('european_aqi', '—')}")
 m7.metric("Renewable potential", round(float(places_df["renewable_score"].mean()), 1) if "renewable_score" in places_df.columns else 0)
 m8.metric("Grid net load", round(float(places_df["net_load"].mean()), 2) if "net_load" in places_df.columns else 0)
 st.info(solar_note)
+
+st.markdown("### 🔬 Scenario-adjusted system state")
+
+# Apply scenario to selected location
+scenario_row = scenario_engine.apply(selected_current)
+
+# recompute renewable + load + risk under scenario
+scenario_risk = compute_multilayer_risk(
+    scenario_row,
+    outage_intensity=clamp(live_outages / 25, 0, 1)
+)
+
+scenario_wind = safe_float(scenario_row.get("wind_speed_10m")) or 0
+scenario_solar = safe_float(scenario_row.get("shortwave_radiation")) or 0
+scenario_aqi = safe_float(scenario_row.get("european_aqi")) or 0
+
+sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+
+sc1.metric(
+    "Scenario wind",
+    f"{round(scenario_wind,1)} km/h",
+    delta=round(scenario_wind - (safe_float(selected_current.get("wind_speed_10m")) or 0),1)
+)
+
+sc2.metric(
+    "Scenario solar",
+    f"{round(scenario_solar,1)} W/m²"
+)
+
+sc3.metric(
+    "Scenario AQI",
+    round(scenario_aqi,1)
+)
+
+sc4.metric(
+    "Scenario renewable",
+    scenario_risk["renewable_generation"]
+)
+
+sc5.metric(
+    "Scenario net load",
+    scenario_risk["net_load"]
+)
 
 st.markdown("### ⚡ System Status")
 
