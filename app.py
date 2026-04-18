@@ -569,7 +569,7 @@ def build_synced_credo_map(
 # =========================================================
 # API FETCH
 # =========================================================
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_weather(lat: float, lon: float) -> Dict:
     params = {
         "latitude": lat,
@@ -584,7 +584,7 @@ def fetch_weather(lat: float, lon: float) -> Dict:
     return response.json()
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_air_quality(lat: float, lon: float) -> Dict:
     params = {
         "latitude": lat,
@@ -599,7 +599,7 @@ def fetch_air_quality(lat: float, lon: float) -> Dict:
     return response.json()
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_npg_live_power_cuts(limit: int = 100) -> Dict:
     safe_limit = min(max(int(limit), 1), 100)
     params = {"limit": safe_limit}
@@ -1034,7 +1034,7 @@ def fetch_all_places(places_dict):
         place, (lat, lon) = item
         return place, combine_weather_air(place, lat, lon)
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=3) as ex:
         results = list(ex.map(worker, places_dict.items()))
 
     return dict(results)
