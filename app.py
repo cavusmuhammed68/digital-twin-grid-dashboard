@@ -352,17 +352,16 @@ def node_marker_symbol(node_type: str) -> str:
 
 
 def node_display_colour(node_type: str, state: int) -> str:
-    if state == 2:
-        return "#ff3b30"
-    if state == 1:
-        return "#ffcc00"
+    """
+    Colour encodes infrastructure TYPE only.
+    State (failure/stress) should be shown via border, glow, or opacity.
+    """
     return {
-        "power": "#ffd60a",
-        "water": "#4ea5ff",
-        "telecom": "#b57cff",
-        "city": "#34c759",
+        "power": "#ffd60a",     # yellow
+        "water": "#4ea5ff",     # blue
+        "telecom": "#b57cff",   # purple
+        "city": "#34c759",      # green
     }.get(node_type, "#cccccc")
-
 
 # =========================================================
 # NETWORK / CREDO HELPERS
@@ -570,7 +569,7 @@ def build_synced_credo_map(
 # =========================================================
 # API FETCH
 # =========================================================
-@st.cache_data(ttl=25, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def fetch_weather(lat: float, lon: float) -> Dict:
     params = {
         "latitude": lat,
@@ -585,7 +584,7 @@ def fetch_weather(lat: float, lon: float) -> Dict:
     return response.json()
 
 
-@st.cache_data(ttl=25, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def fetch_air_quality(lat: float, lon: float) -> Dict:
     params = {
         "latitude": lat,
@@ -600,7 +599,7 @@ def fetch_air_quality(lat: float, lon: float) -> Dict:
     return response.json()
 
 
-@st.cache_data(ttl=25, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def fetch_npg_live_power_cuts(limit: int = 100) -> Dict:
     safe_limit = min(max(int(limit), 1), 100)
     params = {"limit": safe_limit}
@@ -1028,6 +1027,17 @@ def compute_location_risk(row: Dict, outage_intensity: float = 0.0) -> Dict:
     }
 
 
+from concurrent.futures import ThreadPoolExecutor
+
+def fetch_all_places(places_dict):
+    def worker(item):
+        place, (lat, lon) = item
+        return place, combine_weather_air(place, lat, lon)
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        results = list(ex.map(worker, places_dict.items()))
+
+    return dict(results)
 # =========================================================
 # DATA COMBINATION
 # =========================================================
@@ -1116,16 +1126,36 @@ def build_place_dataframe(region_name: str, outages_df: pd.DataFrame, simulation
     rows = []
     raw_cache = {}
 
+    # 🔥 faster iteration
     outage_points = []
-    for _, r in outages_df.iterrows():
+    for r in outages_df.to_dict("records"):
         lat = safe_float(r.get("latitude"))
         lon = safe_float(r.get("longitude"))
         if lat is not None and lon is not None:
             outage_points.append((lat, lon))
 
-    for place, (lat, lon) in REGIONS[region_name]["places"].items():
-        combined = combine_weather_air(place, lat, lon)
-        row = combined["current_row"]
+    places_dict = REGIONS[region_name]["places"]
+
+    # 🚀 paralel fetch
+    all_data = fetch_all_places(places_dict)
+
+    for place, (lat, lon) in places_dict.items():
+        combined = all_data.get(place)
+
+        # ❗ safety
+        if combined is None:
+            combined = {
+                "weather_raw": {},
+                "air_raw": {},
+                "current_row": {
+                    "place": place,
+                    "lat": lat,
+                    "lon": lon,
+                }
+            }
+
+        # ❗ copy to avoid mutation bugs
+        row = dict(combined["current_row"])
 
         nearby_outages = sum(
             1 for olat, olon in outage_points
@@ -1135,7 +1165,11 @@ def build_place_dataframe(region_name: str, outages_df: pd.DataFrame, simulation
         outage_intensity = clamp(nearby_outages / 20, 0, 1)
 
         risk = compute_multilayer_risk(row, outage_intensity)
-        mc = monte_carlo_risk(row, outage_intensity, simulations=simulations)
+
+        if simulations > 0:
+            mc = monte_carlo_risk(row, outage_intensity, simulations=simulations)
+        else:
+            mc = {"risk_std": 0, "risk_p95": 0}
 
         row.update({
             "nearby_outages_25km": nearby_outages,
@@ -1278,17 +1312,26 @@ with st.sidebar:
     selected_place = st.selectbox("Detailed forecast site", list(REGIONS[region_name]["places"].keys()), index=0)
     outage_limit = st.slider("Maximum live outage records to request", 10, 100, 100, 10)
     risk_filter = st.slider("Minimum risk level", 0, 100, 0)
-    scenario_choice = st.selectbox(
-        "Simulation scenario",
-        [
-            "baseline",
-            "storm_cascade",
-            "flood_infrastructure",
-            "heatwave_peak",
-            "pollution_event",
-            "compound_extreme",
-        ],
-    )
+    
+    
+    use_scenario = st.checkbox("Enable scenario simulation", value=False)
+
+    if use_scenario:
+        scenario_choice = st.selectbox(
+            "Scenario type",
+            [
+                "storm_cascade",
+                "flood_infrastructure",
+                "heatwave_peak",
+                "pollution_event",
+                "compound_extreme",
+            ],
+        )
+    else:
+        scenario_choice = "baseline"
+        
+        st.caption("Default mode is real-time (live digital twin). Enable scenarios for stress testing.")
+
 
     st.markdown("---")
     st.subheader("Auto refresh")
@@ -1310,20 +1353,13 @@ with st.sidebar:
         - nearby outage concentration
         """
     )
-
-
-# =========================================================
-# DATA PREP
-# =========================================================
-try:
-    raw_npg = fetch_npg_live_power_cuts(limit=outage_limit)
-    raw_npg_df = payload_to_df(raw_npg)
-    outages_df = standardise_outage_df(raw_npg_df, region_name)
-
-    places_df, raw_cache = build_place_dataframe(region_name, outages_df, simulations=mc_runs)
-    scenario_engine = ScenarioEngine(scenario_choice)
+        
+@st.cache_data(show_spinner=False)
+def run_scenario_cached(places_df: pd.DataFrame, scenario_choice: str):
+    scenario_engine = ScenarioEngine(scenario_choice or "baseline")
 
     enhanced_rows = []
+
     for _, r in places_df.iterrows():
         enhanced = enhanced_risk_with_cascade(
             r.to_dict(),
@@ -1332,17 +1368,71 @@ try:
         )
         enhanced_rows.append(enhanced)
 
-    enhanced_df = pd.DataFrame(enhanced_rows).add_prefix("enh_")
+    return pd.DataFrame(enhanced_rows).add_prefix("enh_")
+
+# =========================================================
+# DATA PREP (OPTIMISED + SCENARIO CACHE)
+# =========================================================
+
+if "base_data" not in st.session_state:
+    st.session_state["base_data"] = None
+
+try:
+    # -----------------------------------------------------
+    # STEP 1: LOAD HEAVY DATA ONLY ONCE
+    # -----------------------------------------------------
+    if st.session_state["base_data"] is None:
+
+        raw_npg = fetch_npg_live_power_cuts(limit=outage_limit)
+        raw_npg_df = payload_to_df(raw_npg)
+        outages_df = standardise_outage_df(raw_npg_df, region_name)
+
+        safe_mc = min(mc_runs, 15)
+
+        places_df, raw_cache = build_place_dataframe(
+            region_name,
+            outages_df,
+            simulations=safe_mc
+        )
+
+        st.session_state["base_data"] = {
+            "outages_df": outages_df,
+            "places_df": places_df,
+            "raw_cache": raw_cache
+        }
+
+    # -----------------------------------------------------
+    # STEP 2: LOAD FROM CACHE (FAST)
+    # -----------------------------------------------------
+    base = st.session_state["base_data"]
+
+    outages_df = base["outages_df"].copy()
+    places_df = base["places_df"].copy()
+    raw_cache = base["raw_cache"]
+
+    # -----------------------------------------------------
+    # STEP 3: SCENARIO (NOW CACHED ⚡)
+    # -----------------------------------------------------
+    places_df_for_cache = places_df.copy().reset_index(drop=True)
+
+    enhanced_df = run_scenario_cached(
+        places_df_for_cache,
+        scenario_choice
+    )
 
     places_df = pd.concat(
         [places_df.reset_index(drop=True), enhanced_df.reset_index(drop=True)],
         axis=1,
     )
 
+    # -----------------------------------------------------
+    # STEP 4: FINAL METRICS
+    # -----------------------------------------------------
     places_df["risk_score"] = places_df["enh_risk_score"]
     places_df["failure_probability"] = places_df["enh_failure_probability"]
     places_df["net_load"] = places_df["enh_net_load"]
     places_df["renewable_generation"] = places_df["enh_renewable_generation"]
+    places_df["final_risk_score"] = places_df["enh_final_risk_score"]
 
     for col in ["risk_score", "final_risk_score", "failure_probability"]:
         if col in places_df.columns:
@@ -1351,9 +1441,15 @@ try:
     if "risk_score" in places_df.columns:
         places_df["risk_label"] = places_df["risk_score"].apply(get_risk_label)
 
+    # -----------------------------------------------------
+    # STEP 5: USER CONTROLS (VERY LIGHT)
+    # -----------------------------------------------------
     if "wind_speed_10m" in places_df.columns:
-        places_df["wind_speed_10m"] = pd.to_numeric(places_df["wind_speed_10m"], errors="coerce").fillna(0)
-        places_df["wind_speed_10m"] *= (1 + simulated_wind / 100)
+        places_df["wind_speed_10m"] = (
+            pd.to_numeric(places_df["wind_speed_10m"], errors="coerce")
+            .fillna(0)
+            * (1 + simulated_wind / 100)
+        )
 
     if "shortwave_radiation" not in places_df.columns:
         places_df["shortwave_radiation"] = 0
@@ -1363,12 +1459,27 @@ try:
         + pd.to_numeric(places_df["wind_speed_10m"], errors="coerce").fillna(0) * 0.4
     )
 
-    digital_twin_df = build_digital_twin_grid(region_name, places_df, outages_df, scenario_engine)
-    digital_twin_df = digital_twin_df[digital_twin_df["risk_score"] >= risk_filter]
+    # -----------------------------------------------------
+    # STEP 6: DIGITAL TWIN GRID
+    # -----------------------------------------------------
+    digital_twin_df = build_digital_twin_grid(
+        region_name,
+        places_df,
+        outages_df,
+        ScenarioEngine(scenario_choice)
+    )
 
+    digital_twin_df = digital_twin_df[
+        digital_twin_df["risk_score"] >= risk_filter
+    ]
+
+    # -----------------------------------------------------
+    # STEP 7: SELECTED SITE
+    # -----------------------------------------------------
     selected_weather = raw_cache[selected_place]["weather_raw"]
     selected_air = raw_cache[selected_place]["air_raw"]
     selected_current = raw_cache[selected_place]["current_row"]
+
     hourly_df = build_hourly_dataframe(selected_weather, selected_air)
 
 except Exception as e:
@@ -1379,6 +1490,10 @@ except Exception as e:
 # =========================================================
 # TOP METRICS
 # =========================================================
+
+# 🔧 FIX: define scenario_engine here
+scenario_engine = ScenarioEngine(scenario_choice or "baseline")
+
 regional_risk = round(float(places_df["risk_score"].mean()), 1) if not places_df.empty and "risk_score" in places_df.columns else 0
 regional_failure_prob = round(float(places_df["failure_probability"].mean()) * 100, 1) if not places_df.empty and "failure_probability" in places_df.columns else 0
 live_outages = len(outages_df)
@@ -1400,6 +1515,7 @@ st.info(solar_note)
 st.markdown("### 🔬 Scenario-adjusted system state")
 
 scenario_row = scenario_engine.apply(selected_current)
+
 scenario_risk = compute_multilayer_risk(
     scenario_row,
     outage_intensity=clamp(live_outages / 25, 0, 1)
@@ -1445,8 +1561,8 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 ])
 
 
-# =========================================================
-# TAB 1
+# TAB 1 #
+
 # =========================================================
 with tab1:
     selected_node = st.session_state.get("credo_selected_node")
@@ -1683,7 +1799,6 @@ with tab1:
     if not places_df.empty:
         worst = places_df.sort_values("risk_score", ascending=False).iloc[0]["place"]
         c3.metric("Highest-risk location", worst)
-
 
 # =========================================================
 # TAB 2
@@ -1942,14 +2057,23 @@ with tab6:
         auto_run = st.checkbox("Run animation", value=True, key="credo_autorun")
         show_failure_waves = st.checkbox("Show failure waves", value=True, key="credo_waves")
         show_cross_region_links = st.checkbox("Show cross-place links", value=True, key="credo_crosslinks")
-        manual_step = st.slider("Manual step", 0, sim_steps - 1, st.session_state.get("credo_last_step", 0), 1, key="credo_manual_step")
+        manual_step = st.slider(
+            "Manual step",
+            0,
+            sim_steps - 1,
+            st.session_state.get("credo_last_step", 0),
+            1,
+            key="credo_manual_step",
+        )
         st.caption("Node click opens detailed metadata and syncs the map below.")
 
+    # -----------------------------------------------------
+    # GRAPH BUILD
+    # -----------------------------------------------------
     G = nx.DiGraph()
     place_lookup = {}
     place_names = list(places_df["place"]) if "place" in places_df.columns else []
 
-    # graph build
     for _, r in places_df.iterrows():
         place = str(r.get("place"))
         row = r.to_dict()
@@ -1998,7 +2122,9 @@ with tab6:
 
     pos = build_credo_layout(place_names)
 
-    # initial seeding
+    # -----------------------------------------------------
+    # INITIAL SEEDING
+    # -----------------------------------------------------
     for place, row in place_lookup.items():
         flood_depth = infer_flood_depth_for_place(row, scenario_choice)
         outages = safe_float(row.get("nearby_outages_25km")) or 0.0
@@ -2007,16 +2133,29 @@ with tab6:
         if outages > 3:
             p_fail = clamp(p_fail + 0.20, 0.0, 0.95)
 
-        if random.random() < p_fail * 0.75:
+        seed_rand = random.random()
+        if seed_rand < p_fail * 0.75:
             G.nodes[f"{place}_power"]["state"] = 2
-        elif random.random() < p_fail:
+        elif seed_rand < p_fail:
             G.nodes[f"{place}_power"]["state"] = 1
 
-    selected_node_name = st.session_state.get("credo_selected_node", place_names[0] if place_names else None)
+    selected_node_name = st.session_state.get(
+        "credo_selected_node",
+        place_names[0] if place_names else None
+    )
 
-    def make_figure(step_idx: int, failed_wave_nodes: List[str], selected_node_name: Optional[str]):
+    # -----------------------------------------------------
+    # FIGURE BUILDER
+    # -----------------------------------------------------
+    def make_figure(
+        graph_obj: nx.DiGraph,
+        step_idx: int,
+        failed_wave_nodes: List[str],
+        selected_node_name: Optional[str],
+    ):
+        # ---------------- edge trace
         edge_x, edge_y = [], []
-        for src, dst in G.edges():
+        for src, dst in graph_obj.edges():
             x0, y0 = pos[src]
             x1, y1 = pos[dst]
             edge_x += [x0, x1, None]
@@ -2027,19 +2166,18 @@ with tab6:
             y=edge_y,
             mode="lines",
             hoverinfo="none",
-            line=dict(width=1.2, color="rgba(180,180,180,0.25)")
+            line=dict(width=1.15, color="rgba(180,180,180,0.24)"),
+            showlegend=False,
         )
 
-        node_x, node_y = [], []
-        node_text, node_hover = [], []
-        node_colors, node_sizes, node_symbols = [], [], []
-        customdata = []
+        # ---------------- node collections
+        node_records = []
         glow_traces = []
 
-        for node_name, data in G.nodes(data=True):
+        for node_name, data in graph_obj.nodes(data=True):
             x, y = pos[node_name]
             node_type = data.get("type", "city")
-            state = data.get("state", 0)
+            state = int(data.get("state", 0))
             parent_place = data.get("parent_place", node_name)
 
             row = place_lookup.get(parent_place, {})
@@ -2048,43 +2186,46 @@ with tab6:
             outages = safe_float(row.get("nearby_outages_25km")) or 0.0
             aqi = safe_float(row.get("european_aqi")) or 0.0
 
-            node_x.append(x)
-            node_y.append(y)
-
             is_selected = selected_node_name == node_name
 
-            size = 20 if node_type == "city" else 16 if node_type == "power" else 13
+            base_size = 20 if node_type == "city" else 16 if node_type == "power" else 13
             if state == 2:
-                size += 4
+                base_size += 4
             elif state == 1:
-                size += 2
+                base_size += 2
             if is_selected:
-                size += 8
-
-            node_sizes.append(size)
-            node_symbols.append(node_marker_symbol(node_type))
-            node_colors.append(node_display_colour(node_type, state))
+                base_size += 7
 
             label_text = f"{node_icon(node_type)} {node_name.replace('_', ' ')}"
-            node_text.append(label_text)
 
-            node_hover.append(
-                "<br>".join([
-                    f"<b>{node_name}</b>",
-                    f"Type: {node_type}",
-                    f"State: {['Normal', 'Stressed', 'Failed'][state]}",
-                    f"Wind: {wind:.1f} km/h",
-                    f"Rain: {rain:.1f} mm",
-                    f"AQI: {aqi:.1f}",
-                    f"Nearby outages: {outages:.0f}",
-                    f"Flood depth proxy: {data.get('flood_depth', 0.0):.2f} m",
-                    f"Direct failure p: {data.get('direct_prob', 0.0):.3f}",
-                    f"Dependency failure p: {data.get('indirect_prob', 0.0):.3f}",
-                ])
-            )
+            hover_text = "<br>".join([
+                f"<b>{node_name}</b>",
+                f"Type: {node_type}",
+                f"State: {['Normal', 'Stressed', 'Failed'][state]}",
+                f"Wind: {wind:.1f} km/h",
+                f"Rain: {rain:.1f} mm",
+                f"AQI: {aqi:.1f}",
+                f"Nearby outages: {outages:.0f}",
+                f"Flood depth proxy: {data.get('flood_depth', 0.0):.2f} m",
+                f"Direct failure p: {data.get('direct_prob', 0.0):.3f}",
+                f"Dependency failure p: {data.get('indirect_prob', 0.0):.3f}",
+            ])
 
-            customdata.append(node_name)
+            node_records.append({
+                "name": node_name,
+                "x": x,
+                "y": y,
+                "type": node_type,
+                "state": state,
+                "size": base_size,
+                "symbol": node_marker_symbol(node_type),
+                "fill": node_display_colour(node_type, state),
+                "text": label_text,
+                "hover": hover_text,
+                "selected": is_selected,
+            })
 
+            # failed red glow
             if state == 2:
                 glow_traces.append(
                     go.Scatter(
@@ -2092,15 +2233,16 @@ with tab6:
                         y=[y],
                         mode="markers",
                         marker=dict(
-                            size=size + 22,
+                            size=base_size + 24,
                             color="rgba(255,59,48,0.14)",
-                            line=dict(width=2, color="rgba(255,59,48,0.40)")
+                            line=dict(width=2, color="rgba(255,59,48,0.38)"),
                         ),
                         hoverinfo="none",
-                        showlegend=False
+                        showlegend=False,
                     )
                 )
 
+            # wave glow
             if show_failure_waves and node_name in failed_wave_nodes:
                 glow_traces.append(
                     go.Scatter(
@@ -2108,34 +2250,91 @@ with tab6:
                         y=[y],
                         mode="markers",
                         marker=dict(
-                            size=size + 34,
-                            color="rgba(255,100,100,0.08)",
-                            line=dict(width=1, color="rgba(255,100,100,0.25)")
+                            size=base_size + 36,
+                            color="rgba(255,120,120,0.07)",
+                            line=dict(width=1, color="rgba(255,120,120,0.24)"),
                         ),
                         hoverinfo="none",
-                        showlegend=False
+                        showlegend=False,
                     )
                 )
 
-        node_trace = go.Scatter(
-            x=node_x,
-            y=node_y,
-            mode="markers+text",
-            text=node_text,
-            textposition="top center",
-            hoverinfo="text",
-            hovertext=node_hover,
-            customdata=customdata,
-            marker=dict(
-                size=node_sizes,
-                color=node_colors,
-                symbol=node_symbols,
-                line=dict(width=1.5, color="white"),
-            ),
-            textfont=dict(size=12, color="white"),
+            # selected node halo
+            if is_selected:
+                glow_traces.append(
+                    go.Scatter(
+                        x=[x],
+                        y=[y],
+                        mode="markers",
+                        marker=dict(
+                            size=base_size + 16,
+                            color="rgba(255,255,255,0.05)",
+                            line=dict(width=2, color="rgba(255,255,255,0.24)"),
+                        ),
+                        hoverinfo="none",
+                        showlegend=False,
+                    )
+                )
+
+        def build_state_trace(records_subset, line_width, line_color, opacity_value, trace_name):
+            if not records_subset:
+                return None
+
+            return go.Scatter(
+                x=[r["x"] for r in records_subset],
+                y=[r["y"] for r in records_subset],
+                mode="markers+text",
+                text=[r["text"] for r in records_subset],
+                textposition="top center",
+                hoverinfo="text",
+                hovertext=[r["hover"] for r in records_subset],
+                customdata=[r["name"] for r in records_subset],
+                marker=dict(
+                    size=[r["size"] for r in records_subset],
+                    color=[r["fill"] for r in records_subset],
+                    symbol=[r["symbol"] for r in records_subset],
+                    opacity=opacity_value,
+                    line=dict(width=line_width, color=line_color),
+                ),
+                textfont=dict(size=12, color="white"),
+                name=trace_name,
+                showlegend=False,
+            )
+
+        normal_records = [r for r in node_records if r["state"] == 0]
+        stressed_records = [r for r in node_records if r["state"] == 1]
+        failed_records = [r for r in node_records if r["state"] == 2]
+
+        normal_trace = build_state_trace(
+            normal_records,
+            line_width=1.4,
+            line_color="rgba(255,255,255,0.85)",
+            opacity_value=1.0,
+            trace_name="Normal",
         )
 
-        fig = go.Figure(data=[edge_trace] + glow_traces + [node_trace])
+        stressed_trace = build_state_trace(
+            stressed_records,
+            line_width=2.3,
+            line_color="#ffcc00",
+            opacity_value=0.72,
+            trace_name="Stressed",
+        )
+
+        failed_trace = build_state_trace(
+            failed_records,
+            line_width=3.0,
+            line_color="#ff3b30",
+            opacity_value=1.0,
+            trace_name="Failed",
+        )
+
+        traces = [edge_trace] + glow_traces
+        for tr in [normal_trace, stressed_trace, failed_trace]:
+            if tr is not None:
+                traces.append(tr)
+
+        fig = go.Figure(data=traces)
 
         fig.update_layout(
             title=f"⚡ CReDo Cascade Simulation — Step {step_idx}",
@@ -2143,18 +2342,19 @@ with tab6:
             plot_bgcolor="#0e1117",
             paper_bgcolor="#0e1117",
             font=dict(color="white"),
-            margin=dict(l=10, r=10, t=45, b=10),
+            margin=dict(l=10, r=10, t=48, b=10),
             xaxis=dict(showgrid=False, zeroline=False, visible=False),
             yaxis=dict(showgrid=False, zeroline=False, visible=False),
-            clickmode="event+select"
+            clickmode="event+select",
         )
 
         return fig
 
-    # precompute step history so manual step works
+    # -----------------------------------------------------
+    # PRECOMPUTE STEP HISTORY
+    # -----------------------------------------------------
     history = []
     wave_history = []
-
     sim_graph = G.copy()
 
     for t in range(sim_steps):
@@ -2166,7 +2366,7 @@ with tab6:
             place = data.get("parent_place", node_name)
             row = place_lookup.get(place, {})
             flood_depth = data.get("flood_depth", 0.0)
-            current_state = data.get("state", 0)
+            current_state = int(data.get("state", 0))
 
             d_prob = direct_failure_probability(node_type, row, flood_depth, t)
             sim_graph.nodes[node_name]["direct_prob"] = d_prob
@@ -2187,6 +2387,7 @@ with tab6:
             else:
                 total_in = max(len(incoming_neighbors), 1)
                 i_prob = (failed_upstream * 1.0 + stressed_upstream * 0.45) / total_in
+
                 if node_type == "water":
                     i_prob *= 1.35
                 elif node_type == "telecom":
@@ -2198,8 +2399,7 @@ with tab6:
             sim_graph.nodes[node_name]["indirect_prob"] = i_prob
 
             combined_fail_prob = clamp(0.55 * d_prob + 0.45 * i_prob, 0.0, 0.75)
-            recover_prob = recovery_probability(node_type, flood_depth, t) * 1.5
-            recover_prob = clamp(recover_prob, 0.0, 0.45)
+            recover_prob = clamp(recovery_probability(node_type, flood_depth, t) * 1.5, 0.0, 0.45)
 
             if current_state == 2:
                 if random.random() < recover_prob:
@@ -2244,11 +2444,15 @@ with tab6:
         history.append(sim_graph.copy())
         wave_history.append(list(failed_wave_nodes))
 
-    # autoplay or manual
+    # -----------------------------------------------------
+    # PLAYBACK
+    # -----------------------------------------------------
     if auto_run:
         active_step = sim_steps - 1
+
         for t in range(sim_steps):
-            fig = make_figure(t, wave_history[t], selected_node_name)
+            current_graph = history[t]
+            fig = make_figure(current_graph, t, wave_history[t], selected_node_name)
 
             with centre_panel:
                 clicked = plotly_events(
@@ -2257,16 +2461,16 @@ with tab6:
                     select_event=False,
                     hover_event=False,
                     override_height=640,
-                    key=f"credo_plot_autoplay_{t}"
+                    key=f"credo_plot_autoplay_{t}",
                 )
 
             if clicked:
                 point_index = clicked[0].get("pointIndex")
                 if point_index is not None:
-                    node_trace_index = len(fig.data) - 1
                     try:
-                        clicked_node = fig.data[node_trace_index].customdata[point_index]
-                        if clicked_node in history[t].nodes:
+                        selected_trace = fig.data[-1]
+                        clicked_node = selected_trace.customdata[point_index]
+                        if clicked_node in current_graph.nodes:
                             selected_node_name = clicked_node
                             st.session_state["credo_selected_node"] = clicked_node
                     except Exception:
@@ -2275,11 +2479,13 @@ with tab6:
             st.session_state["credo_last_step"] = t
             active_step = t
             time.sleep(sim_speed)
+
     else:
         active_step = manual_step
         st.session_state["credo_last_step"] = active_step
 
-        fig = make_figure(active_step, wave_history[active_step], selected_node_name)
+        current_graph = history[active_step]
+        fig = make_figure(current_graph, active_step, wave_history[active_step], selected_node_name)
 
         with centre_panel:
             clicked = plotly_events(
@@ -2288,21 +2494,30 @@ with tab6:
                 select_event=False,
                 hover_event=False,
                 override_height=640,
-                key=f"credo_plot_manual_{active_step}"
+                key=f"credo_plot_manual_{active_step}",
             )
 
         if clicked:
             point_index = clicked[0].get("pointIndex")
             if point_index is not None:
-                node_trace_index = len(fig.data) - 1
                 try:
-                    clicked_node = fig.data[node_trace_index].customdata[point_index]
-                    if clicked_node in history[active_step].nodes:
+                    # trace sonuncu olmak zorunda değil, customdata olan son trace'i bul
+                    clicked_node = None
+                    for trace in reversed(fig.data):
+                        if hasattr(trace, "customdata") and trace.customdata is not None:
+                            if point_index < len(trace.customdata):
+                                clicked_node = trace.customdata[point_index]
+                                break
+
+                    if clicked_node and clicked_node in current_graph.nodes:
                         selected_node_name = clicked_node
                         st.session_state["credo_selected_node"] = clicked_node
                 except Exception:
                     pass
 
+    # -----------------------------------------------------
+    # ACTIVE GRAPH + METADATA
+    # -----------------------------------------------------
     active_graph = history[active_step] if history else G
 
     if not selected_node_name and place_names:
@@ -2313,8 +2528,11 @@ with tab6:
 
     with right_panel:
         st.markdown("### Asset metadata")
+
         if selected_node_name in active_graph.nodes:
             row = place_lookup.get(selected_place_name, {})
+            node_state = int(selected_data.get("state", 0))
+
             st.markdown(
                 f"""
                 **Selected node**  
@@ -2324,7 +2542,7 @@ with tab6:
                 {selected_data.get('type', 'Unknown')}
 
                 **State**  
-                {['Normal', 'Stressed', 'Failed'][selected_data.get('state', 0)]}
+                {['Normal', 'Stressed', 'Failed'][node_state]}
 
                 **Flood depth proxy**  
                 {selected_data.get('flood_depth', 0.0):.2f} m
@@ -2349,16 +2567,45 @@ with tab6:
                 """
             )
 
+            st.markdown("### 🎨 Legend")
+
+            st.markdown("""
+            **Infrastructure type (fill colour)**  
+            - 🟡 Power  
+            - 🟣 Telecom  
+            - 🔵 Water  
+            - 🟢 City  
+
+            **System state (outline / style)**  
+            - ⚪ White outline = Normal  
+            - 🟡 Amber outline + reduced opacity = Stressed  
+            - 🔴 Red outline + red glow = Failed  
+
+            **Visual rules**  
+            - Fill colour shows infrastructure class  
+            - Border colour shows operational state  
+            - Larger node = higher importance / stronger emphasis  
+            - Outer glow = active failure or selected focus
+            """)
+
             st.markdown("### Interpretation")
-            node_state = selected_data.get("state", 0)
+            st.info(
+                "The network visualisation follows a cascading failure logic inspired by CReDo-style interdependent infrastructure modelling. "
+                "Power disruptions can propagate into telecom, water and city-demand nodes through dependency chains."
+            )
+
             if node_state == 2:
                 st.error("This asset is currently failed in the simulation.")
             elif node_state == 1:
-                st.warning("This asset is under stress and may escalate.")
+                st.warning("This asset is currently under stress and may escalate.")
             else:
-                st.success("This asset is currently stable.")
+                st.success("This asset is currently operating in a stable state.")
 
+    # -----------------------------------------------------
+    # SYNCED MAP
+    # -----------------------------------------------------
     st.markdown("### Synced flood and outage map")
+
     synced_map = build_synced_credo_map(
         region_name=region_name,
         selected_place_name=selected_place_name,
